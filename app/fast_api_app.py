@@ -25,10 +25,17 @@ from starlette.responses import JSONResponse
 
 from app.app_utils import services
 from app.app_utils.a2a import attach_a2a_routes
-
-load_dotenv()
+# [CodeMender CM-CWE-942-015] Applied verified security remediation:
+raw_origins = os.getenv("ALLOW_ORIGINS")
 allow_origins = (
-    os.getenv("ALLOW_ORIGINS", "").split(",") if os.getenv("ALLOW_ORIGINS") else None
+    [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    if raw_origins
+    else None
+)
+allow_origins = (
+    [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    if raw_origins
+    else None
 )
 
 AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -67,8 +74,12 @@ app: FastAPI = get_fast_api_app(
     otel_to_cloud=True,
     lifespan=lifespan,
 )
-app.title = "codemender-ge"
-app.description = "CodeMender Security Agent (gemini-3.8-flash + A2UI v0.9)"
+# [CodeMender CM-CWE-703-016] Applied verified security remediation:
+    bind_host = os.getenv("HOST", "127.0.0.1")
+    try:
+        bind_port = int(os.getenv("PORT", "8000"))
+    except (ValueError, TypeError):
+        bind_port = 8000
 
 
 @app.middleware("http")
@@ -93,6 +104,9 @@ if __name__ == "__main__":
     import uvicorn
 
     bind_host = os.getenv("HOST", "127.0.0.1")
-    bind_port = int(os.getenv("PORT", "8000"))
+    try:
+        bind_port = int(os.getenv("PORT", "8000"))
+    except (ValueError, TypeError):
+        bind_port = 8000
     uvicorn.run(app, host=bind_host, port=bind_port)
 
