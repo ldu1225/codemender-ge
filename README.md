@@ -343,11 +343,14 @@ CM_USD_TO_KRW_RATE="1380.0"
 # - 비워두면("") 자동으로 "${GOOGLE_CLOUD_PROJECT}-a2a-bucket" 이름으로 버킷을 생성합니다.
 CM_GCS_ARTIFACT_BUCKET=""
 
-# [선택] 6. GitHub 연동 설정
+# [선택] 6. GitHub 연동 및 세션 보안 (AES-256-GCM 암호화 & TTL 만료) 설정
 # - 비워두면("") 채팅창에서 `깃허브 연동` 입력 시 표준 GitHub Device Flow(8자리 코드 인증)가 작동하며,
-#   발급된 토큰은 각 사용자의 대화 세션(session_id)별로 완벽히 격리 저장됩니다.
+#   발급된 토큰은 각 사용자의 대화 세션(session_id)별로 AES-256-GCM 암호화(`cm_aead_v1:`)되어 격리 저장됩니다.
 GITHUB_OAUTH_CLIENT_ID=""
 GITHUB_TOKEN=""
+CM_TOKEN_ENCRYPTION_KEY=""
+CM_GITHUB_TOKEN_TTL_SECONDS="43200"
+CM_SESSION_TTL_SECONDS="43200"
 ```
 
 #### 📊 환경 변수 상세 요약표
@@ -366,6 +369,9 @@ GITHUB_TOKEN=""
 | `CM_GCS_ARTIFACT_BUCKET` | 선택 | `<PROJECT_ID>-a2a-bucket` | 세션별 격리 스냅샷, 수정 파일 원클릭 다운로드, 비용 원장 저장용 GCS 버킷 |
 | `GITHUB_OAUTH_CLIENT_ID` | 선택 | 표준 GitHub Device Flow | 커스텀 GitHub OAuth App Client ID (선택) |
 | `GITHUB_TOKEN` | 선택 | 없음 | 단일 고정 GitHub PAT을 사용할 경우에만 입력 (비워두면 유저별 OAuth Device Flow 작동) |
+| `CM_TOKEN_ENCRYPTION_KEY` | 선택 | 프로젝트+세션 고유 유도키 | GitHub OAuth 토큰 AES-256-GCM 암호화용 마스터 시드 키 |
+| `CM_GITHUB_TOKEN_TTL_SECONDS` | 선택 | `43200` (12시간) | 세션별 GitHub OAuth 토큰 자동 만료 및 물리 삭제 주기(초) |
+| `CM_SESSION_TTL_SECONDS` | 선택 | `43200` (12시간) | 세션 워크스페이스 스냅샷 자동 만료 및 물리 삭제 주기(초) |
 
 ---
 
@@ -382,6 +388,7 @@ GITHUB_TOKEN=""
    - 프로젝트 번호(`PROJECT_NUMBER`) 조회 및 `GE_ENGINE_ID` 자동 탐색
    - 필수 API 8종(`run`, `cloudbuild`, `artifactregistry`, `aiplatform`, `discoveryengine`, `logging`, `monitoring`, `storage`) 자동 활성화
    - GCS 버킷(`gs://<PROJECT_ID>-a2a-bucket`) 존재 여부 확인 및 미존재 시 자동 생성
+   - **GCS 버킷 수명 주기(Lifecycle) 자동 청소 정책 설정** (`codemender-config/sessions/` 1일 후 자동 삭제, `codemender-patches/` 7일 후 자동 삭제, `codemender-ledger/` 영구 보존)
    - Cloud Logging 비용 메트릭(`codemender_cost_events`) 존재 여부 확인 및 자동 생성
 2. **`[2/5]` Deploying CodeMender Agent to Cloud Run**
    - 소스코드 컨테이너 빌드 및 Cloud Run Gen2 배포 (`.env` 환경 변수 자동 주입)
@@ -505,12 +512,12 @@ codemender-ge/
 │   │   ├── cm_commands.py           # cm v0.12.0 13개 명령어/자연어/맥락 파서 및 리포트 생성기
 │   │   ├── cm_runner.py             # 3-Stage (find -> verify -> fix) 파이프라인 실행 엔진
 │   │   ├── patch_applier.py         # AST 구문 무결성 검증(ast.parse) + 상대 들여쓰기 보존 퍼지 패치 엔진
-│   │   ├── github_integration.py    # 세션별(session_id) GitHub OAuth, 폴더 제외 원격 스캔, 자율 PR 생성기
+│   │   ├── github_integration.py    # 세션 바인딩 AES-256-GCM 토큰 암호화, 폴더 제외 스캔, 자율 PR 생성기
 │   │   └── cost_tracker.py          # Cloud Logging + GCS 영구 비용 원장 온디맨드 정산기
 │   └── ingestion/
 │       └── file_manager.py          # 격리 워크스페이스 관리, ZIP/파일 인제스천, GCS 퍼블리셔
 └── tests/
-    ├── unit/                        # 단위 테스트 스위트 (17개 핵심 보안/세션격리/멀티턴맥락/AST패치 검증 케이스)
+    ├── unit/                        # 단위 테스트 스위트 (17개 핵심 보안/세션격리/AES암호화/멀티턴맥락/AST패치 검증 케이스)
     └── integration/                 # 통합 테스트 스위트 (3개 에이전트/서버 E2E 검증 케이스)
 ```
 
@@ -543,9 +550,13 @@ uv run pytest tests/unit tests/integration -v
 
 - **Q1. 여러 사용자가 동시에 Gemini Enterprise에서 GitHub을 연동하면 다른 사람의 개인 리포지토리에 접근되나요?**
   - **절대 접근되지 않습니다.** GitHub OAuth 토큰과 스캔된 워크스페이스는 각 사용자의 대화 세션 ID(`session_id`)별로 완전히 분리된 GCS 경로(`gs://<BUCKET>/codemender-config/sessions/<session_id>/`)와 `0o600` 권한의 로컬 파일에 격리 저장됩니다. 새로운 채팅방이나 다른 사용자는 본인이 직접 `깃허브 연동`을 수행하기 전까지 타인의 GitHub 계정이나 리포지토리에 일절 접근할 수 없습니다.
-- **Q2. `GE_ENGINE_ID`를 어디서 확인하나요?**
+- **Q2. 매번 세션과 GitHub 토큰을 GCS에 저장하면 파일이 무한히 쌓이거나 토큰이 평문으로 노출되지 않나요?**
+  - **평문 노출과 무한 누적 모두 원천 차단되어 있습니다.**
+    1. **세션 바인딩 AES-256-GCM 암호화**: `github_auth_state.json`에는 평문 `access_token`이 절대 저장되지 않으며, `session_id`를 연관 인증 데이터(AAD)로 바인딩한 **`encrypted_access_token: "cm_aead_v1:..."` 암호문**만 저장됩니다. `session_snapshot.json`에서도 토큰 문자열은 `[REDACTED_GITHUB_TOKEN]`으로 완전 마스킹됩니다.
+    2. **2중 자동 삭제(12시간 TTL + GCS Lifecycle)**: 같은 세션 안에서는 단일 파일을 덮어쓰기(Overwrite)하며, 만료 시각(12시간) 경과 또는 `깃허브 로그아웃` 시 GCS 객체를 즉시 물리 삭제(`HTTP DELETE`)합니다. 또한 GCS 버킷 Lifecycle 규칙이 `codemender-config/sessions/`는 **1일 후**, `codemender-patches/`는 **7일 후 자동 영구 삭제**하도록 설정되어 스토리지가 무한 증가하지 않습니다.
+- **Q3. `GE_ENGINE_ID`를 어디서 확인하나요?**
   - 확인하실 필요가 없습니다! `.env` 파일에서 `GE_ENGINE_ID=""`로 비워두시면 `./scripts/deploy_and_register_ge.sh`가 프로젝트 내 Discovery Engine 목록을 조회하여 자동으로 최신 Gemini Enterprise 엔진을 연결합니다.
-- **Q3. GitHub 스캔이나 PR 생성 시 레포지토리 이름을 매번 다시 적어줘야 하나요?**
+- **Q4. GitHub 스캔이나 PR 생성 시 레포지토리 이름을 매번 다시 적어줘야 하나요?**
   - 적어주지 않아도 됩니다! 예를 들어 1턴에 `codemender-ge레포`라고 말한 뒤 2턴에 `sample폴더외에 다 스캔해`라고 입력하면 직전에 언급한 `codemender-ge` 저장소를 기억하여 `sample`/`samples` 폴더를 제외하고 스캔하며, 패치 적용 후 `pr만들어봐`라고만 입력해도 해당 저장소에 브랜치를 생성하고 PR을 오픈합니다.
 
 ---
