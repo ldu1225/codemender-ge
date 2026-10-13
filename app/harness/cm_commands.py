@@ -922,7 +922,7 @@ async def execute_cm_command(
         if parsed_cmd.get("verify", True):
             verify_block = (
                 "\n#### ✅ `--verify` 환경 및 보안 샌드박스 점검 결과\n"
-                f"- **추론 엔드포인트**: `Vertex AI (global)` · 모델 `{active_model}` 준비 완료\n"
+                f"- **추론 엔드포인트**: `GEAP (global)` · 모델 `{active_model}` 준비 완료\n"
                 f"- **격리 샌드박스 루트**: `{workspace.root_dir}` (`chmod 0700`, `shell=False` 강제)\n"
                 "- **로컬 상태 저장소**: `.codemender/config.yaml` 및 세션 아티팩트 스토어 활성화\n"
             )
@@ -1685,7 +1685,7 @@ async def execute_cm_command(
             f"> 💳 **{as_of_date}까지 총 누적 청구(발생) 예상 금액**: **{format_usd(ledger_tot_usd)} ({format_krw(ledger_tot_krw)})**  ",
             f"> 📊 **집계 기간**: `{billing_period}` · **총 세션 수**: `{max(len(sessions_list), 1)}개 세션` · **총 트랜잭션 수**: `{ledger_tot_runs}건` · **총 토큰**: `{format_tokens(ledger_tot_tok)}`",
             "",
-            f"- **활성 추론 모델**: `{active_model}` (`Vertex AI global`) | **환율 기준**: `$1.00 = ₩{CM_USD_TO_KRW_RATE:,.0f}원`",
+            f"- **활성 추론 모델**: `{active_model}` (`GEAP global`) | **환율 기준**: `$1.00 = ₩{CM_USD_TO_KRW_RATE:,.0f}원`",
             f"- **단가 기준 (`{active_model}`)**: Input `${pricing['input']:.2f}/1M tok` · Output `${pricing['output']:.2f}/1M tok` · Thinking `${pricing['thinking']:.2f}/1M tok` · Cloud Run Gen2 Sandbox `${CLOUD_RUN_VCPU_PER_SEC_USD + CLOUD_RUN_GIB_PER_SEC_USD:.6f}/sec`",
             "- **온디맨드 표시 정책**: 일반 보안 진단·패치 실행 시에는 대화창이 번잡해지지 않도록 백그라운드(`Cloud Logging` + 원장)에만 기록하며, **비용을 물어보실 때만** 일자별 총 청구 금액과 세션별·트랜잭션별 상세 내역을 조회해 안내합니다.",
             "",

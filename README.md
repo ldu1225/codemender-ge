@@ -3,7 +3,7 @@
 [![A2A Protocol](https://img.shields.io/badge/A2A_Protocol-v0.3.0-blue?style=flat-square)](https://a2a-protocol.org/)
 [![A2UI Spec](https://img.shields.io/badge/A2UI-v0.9_Catalog-00897b?style=flat-square)](https://a2ui.org/)
 [![Google ADK](https://img.shields.io/badge/Google_ADK-1.16+-4285F4?style=flat-square)](https://adk.dev/)
-[![Reasoning Model](https://img.shields.io/badge/Vertex_AI-Gemini_3.8_Flash-fbbc04?style=flat-square)](https://cloud.google.com/vertex-ai)
+[![Reasoning Model](https://img.shields.io/badge/GEAP-Gemini_3.8_Flash-fbbc04?style=flat-square)](#)
 [![Session Isolation](https://img.shields.io/badge/Multi_User-Per_Session_Isolated-8e24aa?style=flat-square)](#23-멀티유저-세션-격리per-session-isolation-및-cloud-run-무상태-복원-아키텍처)
 [![Zero Hardcoding](https://img.shields.io/badge/Customer_Ready-Zero_Hardcoding-2ea44f?style=flat-square)](#)
 
@@ -52,7 +52,7 @@
 
 ### 2.1 전체 엔드투엔드 인프라 및 A2A/A2UI 아키텍처
 
-Gemini Enterprise 웹 UI부터 Cloud Run 에이전트 컨테이너, Vertex AI 추론 엔진, GCS 세션 격리 스토리지, 그리고 GitHub REST API v3까지의 전체 데이터 흐름입니다.
+Gemini Enterprise 웹 UI부터 Cloud Run 에이전트 컨테이너, GEAP 추론 엔진, GCS 세션 격리 스토리지, 그리고 GitHub REST API v3까지의 전체 데이터 흐름입니다.
 
 ```mermaid
 flowchart TB
@@ -77,7 +77,7 @@ flowchart TB
     end
 
     subgraph GCP["☁️ Google Cloud Platform Backend"]
-        Vertex["✨ Vertex AI (Global)<br/>• gemini-3.8-flash (Primary)<br/>• gemini-3.7-flash (Fallback)<br/>• gemini-3.6-pro (Deep Audit)"]
+        GEAP["✨ GEAP (Global)<br/>• gemini-3.8-flash (Primary)<br/>• gemini-3.7-flash (Fallback)<br/>• gemini-3.6-pro (Deep Audit)"]
         GCS["🪣 Cloud Storage (gs://PROJECT-a2a-bucket)<br/>• /codemender-config/sessions/&lt;session_id&gt;/ (유저별 격리 스냅샷 & 토큰)<br/>• /codemender-patches/ (패치 완료 파일 1-Click 다운로드)<br/>• /codemender-ledger/ (온디맨드 비용 정산 원장)"]
         Logging["📊 Cloud Logging<br/>• CODEMENDER_COST_TELEMETRY<br/>• Cloud Run Request Latency"]
     end
@@ -89,7 +89,7 @@ flowchart TB
 
     UserA & UserB <-->|"독립 세션 대화 (session_id 분리)"| Assistant
     Assistant <-->|"IAM roles/run.invoker"| FastAPI
-    Harness <-->|"3-Stage 추론 & LLM Judge"| Vertex
+    Harness <-->|"3-Stage 추론 & LLM Judge"| GEAP
     Agent <-->|"세션별 상태/OAuth 토큰 격리 동기화"| GCS
     Harness <-->|"패치 아티팩트 & 비용 원장 저장"| GCS
     Harness <-->|"구조화 비용 로그 방출/조회"| Logging
@@ -109,7 +109,7 @@ flowchart LR
     Input["📥 소스코드 인제스천<br/>(파일 업로드 / ZIP / GitHub 리포)"] --> Stage1
 
     subgraph Stage1["🔍 Stage 1: cm find (탐색)"]
-        S1A["정적 패턴 + Vertex AI 의미론적 스캔"]
+        S1A["정적 패턴 + GEAP 의미론적 스캔"]
         S1B["CWE / OWASP Top 10 후보 도출"]
         S1A --> S1B
     end
@@ -323,7 +323,7 @@ GOOGLE_CLOUD_PROJECT="my-company-gcp-project"
 GE_LOCATION="us"
 GE_ENGINE_ID=""
 
-# [선택] 3. Cloud Run 및 Vertex AI 리전 설정
+# [선택] 3. Cloud Run 및 GEAP 리전 설정
 CLOUD_RUN_REGION="us-central1"
 GOOGLE_CLOUD_LOCATION="global"
 SERVICE_NAME="codemender-ge"
@@ -353,7 +353,7 @@ GITHUB_TOKEN=""
 | `GE_LOCATION` | 선택 | `us` | Gemini Enterprise(Discovery Engine) 멀티 리전 (`us`, `eu`, `global`) |
 | `GE_ENGINE_ID` | 선택 | **자동 탐색** | 비워두면 프로젝트 내 최신 Gemini Enterprise Engine ID를 API로 자동 조회 |
 | `CLOUD_RUN_REGION` | 선택 | `us-central1` | Cloud Run 서비스가 배포될 리전 |
-| `GOOGLE_CLOUD_LOCATION` | 선택 | `global` | Vertex AI Gemini 모델 엔드포인트 리전 (`global` 권장) |
+| `GOOGLE_CLOUD_LOCATION` | 선택 | `global` | GEAP Gemini 모델 엔드포인트 리전 (`global` 권장) |
 | `SERVICE_NAME` | 선택 | `codemender-ge` | Cloud Run 서비스 이름 |
 | `AGENT_DISPLAY_NAME` | 선택 | `CodeMender Security Agent (Gemini 3.8 Flash)` | Gemini Enterprise 에이전트 목록에 표시될 이름 |
 | `CODEMENDER_MODEL` | 선택 | `gemini-3.8-flash` | 기본 보안 추론 및 검증 모델 |
@@ -446,7 +446,7 @@ Gemini Enterprise 웹 콘솔 좌측 메뉴의 **Agents** 탭에서 `CodeMender S
 
 | # | 카테고리 | 명령어 (CLI / 자연어 예시) | 설명 |
 | :-: | :--- | :--- | :--- |
-| **1** | **초기화** | `cm init [--verify]` / `워크스페이스 초기화` | 격리 샌드박스 워크스페이스 초기화 및 Vertex AI/컴파일러 상태 점검 |
+| **1** | **초기화** | `cm init [--verify]` / `워크스페이스 초기화` | 격리 샌드박스 워크스페이스 초기화 및 GEAP/컴파일러 상태 점검 |
 | **2** | **취약점 탐지 (Stage 1)** | `cm find [<path>]` / `샘플 진단 실행` | 정적/의미론적 취약점 스캔 및 CWE/OWASP 매핑 |
 | **3** | **PoC 검증 (Stage 2)** | `cm verify [<id\|ALL>]` / `샌드박스 검증` | 샌드박스 AST/데이터흐름 검증 및 오탐(False Positive) 필터링 |
 | **4** | **보안 패치 (Stage 3)** | `cm fix [<id\|ALL>] [-c "<지침>"]` / `패치 적용` | 보안 패치 생성·적용, 커스텀 지침(`-c`) 반영, 또는 원본 롤백(`--revert`) |

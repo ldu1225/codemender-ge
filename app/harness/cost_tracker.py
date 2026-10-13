@@ -15,7 +15,7 @@
 """Real-time LLM token & Cloud Run sandbox cost tracking for CodeMender 3-Stage Harness.
 
 Tracks per-stage (cm find, cm verify, cm fix + Judge, HITL patch apply) token consumption,
-Vertex AI Gemini API pricing, Cloud Run Gen2 isolated sandbox compute cost, session-level
+GEAP Gemini API pricing, Cloud Run Gen2 isolated sandbox compute cost, session-level
 cumulative totals, and persistent workspace ledger totals in both USD and KRW.
 """
 
