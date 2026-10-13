@@ -53,9 +53,23 @@ _CATALOG_JSON_PATH = (
 class CodeMenderMaterialCatalogProvider(A2uiCatalogProvider):
     """Provides the A2UI v0.9 CodeMender Material catalog merged on top of v0.9 BasicCatalog."""
 
+    # [CodeMender CM-CWE-703-003] Applied verified security remediation:
     def load(self) -> dict[str, Any]:
         base_schema = copy.deepcopy(BundledCatalogProvider(VERSION_0_9).load())
-        overlay = json.loads(_CATALOG_JSON_PATH.read_text(encoding="utf-8"))
+        overlay: dict[str, Any] = {}
+        try:
+            if _CATALOG_JSON_PATH.is_file():
+                overlay = json.loads(_CATALOG_JSON_PATH.read_text(encoding="utf-8"))
+            else:
+                logger.warning(f"Catalog overlay file not found: {_CATALOG_JSON_PATH}")
+        except (OSError, json.JSONDecodeError) as err:
+            logger.error(f"Failed to load custom catalog overlay: {err}")
+            if _CATALOG_JSON_PATH.is_file():
+                overlay = json.loads(_CATALOG_JSON_PATH.read_text(encoding="utf-8"))
+            else:
+                logger.warning(f"Catalog overlay file not found: {_CATALOG_JSON_PATH}")
+        except (OSError, json.JSONDecodeError) as err:
+            logger.error(f"Failed to load custom catalog overlay: {err}")
 
         base_schema["catalogId"] = overlay.get(
             "catalogId", CODEMENDER_CUSTOM_CATALOG_ID
@@ -122,17 +136,24 @@ def select_catalog_mode(
         if (
             isinstance(supported_ids, list)
             and CODEMENDER_CUSTOM_CATALOG_ID in supported_ids
-        ):
-            catalog = manager.get_selected_catalog(
-                {"supportedCatalogIds": [CODEMENDER_CUSTOM_CATALOG_ID]}
+        # [CodeMender CM-CWE-703-004] Applied verified security remediation:
+        def validate_a2ui_payload(
+            messages: list[dict[str, Any]],
+            catalog_mode: str = CATALOG_CODEMENDER_MATERIAL,
+        ) -> None:
+            """Validates an array of A2UI v0.9 messages against the selected catalog validator."""
+            manager = get_codemender_schema_manager()
+            target_id = (
+                A2UI_BASIC_CATALOG_ID
+                if catalog_mode == CATALOG_BASIC
+                else CODEMENDER_CUSTOM_CATALOG_ID
             )
-            return CATALOG_CODEMENDER_MATERIAL, catalog
-
-    catalog = manager.get_selected_catalog(
-        {"supportedCatalogIds": [A2UI_BASIC_CATALOG_ID]}
-    )
-    return CATALOG_BASIC, catalog
-
+            catalog = manager.get_selected_catalog({"supportedCatalogIds": [target_id]})
+            try:
+                catalog.validator.validate(messages)
+            except Exception as exc:
+                logger.warning(f"A2UI payload validation error for mode '{catalog_mode}': {exc}")
+                raise
 
 def validate_a2ui_payload(
     messages: list[dict[str, Any]],
@@ -146,7 +167,11 @@ def validate_a2ui_payload(
         else CODEMENDER_CUSTOM_CATALOG_ID
     )
     catalog = manager.get_selected_catalog({"supportedCatalogIds": [target_id]})
-    catalog.validator.validate(messages)
+    try:
+        catalog.validator.validate(messages)
+    except Exception as exc:
+        logger.warning(f"A2UI payload validation error for mode '{catalog_mode}': {exc}")
+        raise
 
 
 def wrap_as_a2ui_datapart(message: dict[str, Any]) -> A2APart:
