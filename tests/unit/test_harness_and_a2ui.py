@@ -773,4 +773,26 @@ def test_conversational_context_and_natural_commands(monkeypatch) -> None:
     assert "비공개(Private) GitHub 레포지토리 목록" in multiline_cmd_out
     assert "payment-gateway-service" in multiline_cmd_out
 
+    # 8. Multi-turn context:
+    #    Turn A: "codemender-ge레포" -> sets target repo without triggering a scan
+    #    Turn B: "sample폴더외에 다 스캔해" -> scans the target repo (`dulee-dev/codemender-ge`) with `sample`/`samples` excluded, NOT `sample_payment_service.py`!
+    #    Turn C: "뭔데 이게" -> conversational explanation, NOT a scan
+    #    Turn D: "대상 파일: sample_payment_service.py 이게지금어디에있는건데" -> explains file origin/location, NOT a scan!
+    turn1_out = _chat("codemender-ge레포")
+    assert "codemender-ge" in turn1_out
+    assert "CodeMender 3-Stage 보안 진단 및 패치 리포트" not in turn1_out
 
+    turn2_out = _chat("sample폴더외에 다 스캔해")
+    assert "GitHub 레포지토리 실시간 연동 스캔 완료" in turn2_out
+    assert "codemender-ge" in turn2_out
+    assert "제외된 경로 필터" in turn2_out
+    assert "sample" in turn2_out
+    assert "sample_payment_service.py" not in turn2_out
+
+    turn3_out = _chat("뭔데 이게")
+    assert "CodeMender 3-Stage 보안 진단 및 패치 리포트" not in turn3_out
+
+    turn4_out = _chat("대상 파일: sample_payment_service.py 이게지금어디에있는건데")
+    assert "CodeMender 3-Stage 보안 진단 및 패치 리포트" not in turn4_out
+    assert "sample_payment_service.py" in turn4_out
+    assert "데모" in turn4_out or "컨테이너" in turn4_out

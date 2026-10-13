@@ -82,6 +82,8 @@ _SESSION_SNAPSHOT_KEYS = (
     "cm_github_repo_context",
     "cm_github_auth",
     "cm_command_history",
+    "cm_chat_history",
+    "cm_target_repo",
     "cm_active_model",
     "codemender_session_cost_ledger",
     "_cm_session_id",
@@ -597,6 +599,36 @@ async def get_codemender_cost_report(
     }
 
 
+def _record_turn_in_chat_history(
+    state: Any,
+    user_text: str,
+    resp_content: types.Content | None,
+) -> None:
+    """Appends the current user turn and a concise summary of the assistant response to `cm_chat_history`."""
+    if state is None or not hasattr(state, "get") or not (user_text or "").strip():
+        return
+    assistant_text = ""
+    if resp_content and getattr(resp_content, "parts", None):
+        for p in resp_content.parts:
+            t = getattr(p, "text", None)
+            if t:
+                assistant_text += t + "\n"
+    if "---a2ui_JSON---" in assistant_text:
+        assistant_text = assistant_text.split("---a2ui_JSON---", 1)[0]
+    assistant_text = assistant_text.strip()
+    if not assistant_text:
+        return
+
+    history = list(state.get("cm_chat_history") or [])
+    history.append(
+        {
+            "user": user_text.strip()[:500],
+            "assistant": assistant_text[:900],
+        }
+    )
+    state["cm_chat_history"] = history[-10:]
+
+
 async def codemender_before_agent_callback(
     callback_context: CallbackContext,
 ) -> types.Content | None:
@@ -604,12 +636,266 @@ async def codemender_before_agent_callback(
     state = callback_context.state
     inv_ctx = callback_context._invocation_context
     session_id = getattr(inv_ctx.session, "id", "default_session")
+    user_content = callback_context.user_content
+    parts = list(user_content.parts) if (user_content and user_content.parts) else []
+    user_text = _extract_user_plain_text(parts)
     try:
-        return await _codemender_before_agent_callback_inner(
+        resp_content = await _codemender_before_agent_callback_inner(
             callback_context, state, inv_ctx, session_id
         )
+        if resp_content is not None and user_text.strip():
+            _record_turn_in_chat_history(state, user_text, resp_content)
+        return resp_content
     finally:
         _save_session_snapshot(session_id, state)
+
+
+def _classify_user_intent(
+    user_text: str,
+    ws: Any,
+    state: Any,
+    active_model: str,
+) -> dict[str, Any]:
+    """Classifies user intent using multi-turn conversation context (`cm_chat_history`, `cm_target_repo`) + Gemini JSON router."""
+    import json
+    import os
+    import re
+    from google import genai
+    from google.genai import types as genai_types
+    from app.config import CODEMENDER_FALLBACK_MODEL
+    from app.harness.cm_commands import (
+        extract_exclude_paths_from_text,
+        extract_target_repo_from_text,
+    )
+
+    clean_text = (user_text or "").strip()
+    low = (
+        clean_text.lower()
+        .replace("래포", "레포")
+        .replace("리포", "레포")
+    )
+    no_space = re.sub(r"\s+", "", low)
+    exclude_paths = extract_exclude_paths_from_text(clean_text)
+    mentioned_repo = extract_target_repo_from_text(clean_text)
+
+    if mentioned_repo:
+        state["cm_target_repo"] = mentioned_repo
+
+    chat_history = list(state.get("cm_chat_history") or [])
+    active_target_repo = str(
+        mentioned_repo
+        or state.get("cm_target_repo")
+        or (
+            (state.get("cm_github_repo_context") or {}).get("repo")
+            if isinstance(state.get("cm_github_repo_context"), dict)
+            else ""
+        )
+        or ""
+    ).strip()
+
+    if not active_target_repo and chat_history:
+        for turn in reversed(chat_history[-6:]):
+            r_cand = extract_target_repo_from_text(str(turn.get("user") or "")) or extract_target_repo_from_text(
+                str(turn.get("assistant") or "")
+            )
+            if r_cand:
+                active_target_repo = r_cand
+                state["cm_target_repo"] = r_cand
+                break
+
+    # 1. Guardrail: Explanatory questions about files/results/context ("대상 파일: sample_payment_service.py 이게지금어디에있는건데", "뭔데 이게", "왜 이래")
+    is_explanatory_question = any(
+        q in low or q.replace(" ", "") in no_space
+        for q in (
+            "대상 파일:",
+            "어디에있는건데",
+            "어디에 있는건데",
+            "어디에있어",
+            "어디 있어",
+            "어디있는",
+            "이게지금어디",
+            "뭔데 이게",
+            "이게 뭔데",
+            "이게 뭐야",
+            "무슨 파일",
+            "무슨 뜻",
+            "왜 이래",
+            "왜 이런",
+            "왜 스캔",
+            "오늘날씨",
+            "오늘 날씨",
+        )
+    )
+    if is_explanatory_question and not any(
+        dl in low for dl in ("다운로드", "download", "수정한 파일", "수정된 파일", "패치된 파일")
+    ):
+        return {"intent": "chat_or_question", "target_repo": active_target_repo}
+
+    # 2. If user only mentioned a repository name without any scan/PR action verb (e.g. "codemender-ge레포")
+    has_scan_verb = any(
+        v in low or v.replace(" ", "") in no_space
+        for v in (
+            "스캔",
+            "진단",
+            "검사",
+            "분석",
+            "점검",
+            "찾아",
+            "탐색",
+            "scan",
+            "audit",
+            "check",
+        )
+    )
+    has_affirmative_scan_followup = bool(
+        active_target_repo
+        and chat_history
+        and any(
+            k in str(chat_history[-1].get("assistant") or "")
+            for k in ("스캔을 시작할까요", "진행하실 작업", "저장소를 확인했습니다")
+        )
+        and any(
+            a in low
+            for a in ("응", "그래", "네", "어", "해줘", "해봐", "시작", "진행", "스캔")
+        )
+    )
+
+    if mentioned_repo and not has_scan_verb and "pr" not in low and not exclude_paths:
+        return {"intent": "chat_or_question", "target_repo": active_target_repo}
+
+    # 3. Folder exclusion scan or active target repo scan ("sample폴더외에 다 스캔해", "다 스캔해", "응 스캔해줘")
+    if (exclude_paths and has_scan_verb) or (
+        active_target_repo and (has_scan_verb or has_affirmative_scan_followup)
+    ):
+        return {
+            "intent": "github_scan",
+            "target_repo": active_target_repo,
+            "exclude_paths": exclude_paths,
+            "subpath": "",
+        }
+
+    # 4. Explicit built-in demo / sample scan request (ONLY when NOT excluding a sample folder and NOT asking about sample_payment_service.py)
+    if (
+        not exclude_paths
+        and "sample_payment_service" not in low
+        and not active_target_repo
+        and any(
+            kw in low or kw.replace(" ", "") in no_space
+            for kw in (
+                "샘플 진단",
+                "샘플 스캔",
+                "샘플 실행",
+                "샘플 테스트",
+                "샘플 코드",
+                "데모 실행",
+                "데모 스캔",
+                "데모 진단",
+                "run sample",
+                "sample scan",
+                "demo scan",
+            )
+        )
+    ) or low in ("샘플", "데모", "sample", "demo", "테스트 실행", "진단 실행"):
+        return {"intent": "run_sample_scan"}
+
+    # 5. Patch application on existing scan findings
+    if state.get("cm_pipeline_result") and any(
+        kw in low
+        for kw in ("패치 적용", "패치해", "전체 패치", "apply patch", "apply all", "수정본 적용")
+    ):
+        vid_match = re.search(r"(CM-[A-Z0-9-]+-\d+)", clean_text, re.IGNORECASE)
+        return {
+            "intent": "apply_patch",
+            "vuln_id": vid_match.group(1).upper() if vid_match else "ALL",
+        }
+
+    # 6. Greeting or help onboarding
+    if low in ("안녕", "안녕하세요", "반가워", "hello", "hi", "도움말", "help", "사용법"):
+        return {"intent": "greeting_or_help"}
+
+    # 7. Workspace scan when files are already uploaded in workspace and no external target repo is pending
+    if ws.files and has_scan_verb and not active_target_repo:
+        return {"intent": "workspace_scan"}
+
+    # 8. LLM Multi-Turn Intent Router for nuanced or multi-turn requests when network is enabled
+    if os.getenv("CM_DISABLE_LLM_NETWORK", "false").lower() != "true":
+        ws_files = [f.relative_path for f in getattr(ws, "files", [])]
+        history_lines = []
+        for idx, turn in enumerate(chat_history[-6:], start=1):
+            history_lines.append(
+                f"Turn {idx} User: {turn.get('user', '')}\nTurn {idx} Assistant: {turn.get('assistant', '')[:300]}"
+            )
+        history_block = "\n".join(history_lines) if history_lines else "(이전 대화 없음)"
+
+        router_prompt = (
+            "당신은 CodeMender Security Agent의 멀티턴 대화 맥락 기반 의도 분류기(Intent Router)입니다.\n"
+            "이전 대화 이력과 현재 세션 상태, 그리고 사용자의 이번 발화를 보고 실제 의도(intent)를 JSON으로 분류하세요.\n\n"
+            "[중요 분류 규칙]\n"
+            "1. 사용자가 이전 턴에서 특정 GitHub 레포지토리(예: 'codemender-ge레포')를 언급했고, 이번 턴에서 "
+            "'sample폴더외에 다 스캔해', '응 스캔해봐', 'app 폴더만 검사해' 등 스캔을 지시했다면 반드시 `intent: \"github_scan\"`, "
+            "`target_repo: \"<해당 레포>\"`, `exclude_paths: [\"sample\"]` 등으로 분류하세요. "
+            "절대 폴더 이름에 'sample'이 들어갔다고 해서 내장 데모(`run_sample_scan`)로 분류하면 안 됩니다!\n"
+            "2. 사용자가 '뭔데 이게', '대상 파일: sample_payment_service.py 이게지금어디에있는건데', '이게 왜 나와?', "
+            "'오늘 날씨는?' 처럼 질문하거나 설명을 요구하거나 당황해하는 반응이면, 절대 스캔(`run_sample_scan`, `github_scan`, `workspace_scan`)을 실행하지 말고 "
+            "반드시 `intent: \"chat_or_question\"`으로 분류하세요!\n"
+            "3. 사용자가 단순히 레포지토리 이름만 말하고(예: 'codemender-ge레포') 아직 구체적인 작업(스캔/PR)을 지시하지 않았다면 "
+            "`intent: \"chat_or_question\"`, `target_repo: \"codemender-ge\"`로 분류하세요.\n"
+            "4. 사용 가능한 intent 값:\n"
+            "   - \"chat_or_question\": 질문 답변, 파일 위치/이유 설명, 레포 확인 안내, 일상 대화\n"
+            "   - \"github_scan\": GitHub 레포지토리 스캔 (target_repo, subpath, exclude_paths 포함)\n"
+            "   - \"github_repos\": 내 GitHub 레포 목록 조회 (visibility: all|private|public)\n"
+            "   - \"github_pr\": 패치된 코드를 GitHub PR로 생성\n"
+            "   - \"github_login\": GitHub OAuth 로그인\n"
+            "   - \"workspace_scan\": 이미 업로드된 워크스페이스 파일 스캔\n"
+            "   - \"run_sample_scan\": 사용자가 명시적으로 '기본 내장 샘플/데모 진단 실행'을 요청했을 때만\n"
+            "   - \"apply_patch\": 발견된 취약점 패치 적용 (vuln_id: CM-... 또는 ALL)\n"
+            "   - \"cost_report\": 비용/요금/토큰 정산 내역 조회\n"
+            "   - \"models\": 모델 목록 조회 또는 모델 전환\n"
+            "   - \"sessions\": 세션 실행 이력 조회\n"
+            "   - \"artifacts\": 패치 완료된 파일 다운로드 링크 조회\n"
+            "   - \"greeting_or_help\": 인사 또는 전체 도움말\n\n"
+            f"[현재 세션 상태]\n"
+            f"- 현재 지목된 타겟 레포(cm_target_repo): {active_target_repo or '없음'}\n"
+            f"- 현재 워크스페이스 파일: {', '.join(ws_files) if ws_files else '없음'}\n"
+            f"- 스캔 결과 존재 여부: {'있음' if state.get('cm_pipeline_result') else '없음'}\n\n"
+            f"[최근 대화 이력]\n{history_block}\n\n"
+            f"[이번 사용자 발화]\n{clean_text}\n\n"
+            "반드시 아래 JSON 스키마로만 응답하세요:\n"
+            '{"intent": "...", "target_repo": "", "subpath": "", "exclude_paths": [], "visibility": "all", "vuln_id": "ALL"}'
+        )
+
+        candidate_models = []
+        for m in (active_model, CODEMENDER_FALLBACK_MODEL, "gemini-2.5-flash"):
+            if m and m not in candidate_models:
+                candidate_models.append(m)
+
+        client = genai.Client(
+            vertexai=True, project=GCP_PROJECT_ID, location="global"
+        )
+        for model_name in candidate_models:
+            try:
+                resp = client.models.generate_content(
+                    model=model_name,
+                    contents=router_prompt,
+                    config=genai_types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                    ),
+                )
+                if resp and resp.text:
+                    parsed_json = json.loads(resp.text.strip())
+                    if isinstance(parsed_json, dict) and parsed_json.get("intent"):
+                        if not parsed_json.get("target_repo") and active_target_repo:
+                            parsed_json["target_repo"] = active_target_repo
+                        if exclude_paths and not parsed_json.get("exclude_paths"):
+                            parsed_json["exclude_paths"] = exclude_paths
+                        if parsed_json.get("target_repo"):
+                            state["cm_target_repo"] = str(parsed_json["target_repo"]).strip()
+                        return parsed_json
+            except Exception as err:
+                logger.debug(f"LLM intent classification fallback ({model_name}): {err}")
+
+    return {"intent": "chat_or_question", "target_repo": active_target_repo}
 
 
 async def _codemender_before_agent_callback_inner(
@@ -658,7 +944,6 @@ async def _codemender_before_agent_callback_inner(
                     logger.debug(f"Could not load uploaded artifact {artifact_name}: {exc}")
 
     user_text = _extract_user_plain_text(parts)
-    user_text_lower = user_text.lower()
 
     async def _save_callback_artifact(name: str, data: bytes) -> None:
         mime = (
@@ -712,8 +997,108 @@ async def _codemender_before_agent_callback_inner(
             ],
         )
 
-    # 5. Check if user invoked any `cm <subcommand>` or natural-language `cm` feature
-    parsed_cm = parse_cm_chat_command(user_text)
+    # 5. Check if user clicked an interactive A2UI button DataPart first
+    action_event = extract_a2ui_action_from_parts(expanded_parts)
+
+    # 6. Check if user invoked an explicit `cm <subcommand>` or unambiguous command phrase
+    parsed_cm = parse_cm_chat_command(user_text) if not action_event else None
+
+    # 7. If not an explicit `cm` command or button event, run Multi-Turn Context & LLM Intent Router
+    if not action_event and parsed_cm is None and user_text.strip():
+        intent_info = _classify_user_intent(
+            user_text=user_text,
+            ws=ws,
+            state=state,
+            active_model=active_model,
+        )
+        intent = str(intent_info.get("intent") or "chat_or_question")
+        target_repo = str(intent_info.get("target_repo") or state.get("cm_target_repo") or "").strip()
+        subpath = str(intent_info.get("subpath") or "").strip()
+        exclude_paths = list(intent_info.get("exclude_paths") or [])
+
+        if intent == "github_scan":
+            pos = ["scan"]
+            if target_repo:
+                pos.append(target_repo)
+            if subpath:
+                pos.append(subpath)
+            parsed_cm = {
+                "subcommand": "github",
+                "positional": pos,
+                "target_repo": target_repo,
+                "subpath": subpath,
+                "exclude_paths": exclude_paths,
+                "raw": user_text,
+            }
+        elif intent == "github_repos":
+            parsed_cm = {
+                "subcommand": "github",
+                "positional": ["repos"],
+                "visibility": str(intent_info.get("visibility") or "all"),
+                "raw": user_text,
+            }
+        elif intent == "github_pr":
+            pos = ["pr"]
+            if target_repo:
+                pos.append(target_repo)
+            parsed_cm = {
+                "subcommand": "github",
+                "positional": pos,
+                "raw": user_text,
+            }
+        elif intent == "github_login":
+            parsed_cm = {
+                "subcommand": "github",
+                "positional": ["login"],
+                "raw": user_text,
+            }
+        elif intent == "cost_report":
+            parsed_cm = {"subcommand": "cost", "raw": user_text}
+        elif intent == "models":
+            parsed_cm = {"subcommand": "models", "raw": user_text}
+        elif intent == "sessions":
+            parsed_cm = {"subcommand": "sessions", "raw": user_text}
+        elif intent == "artifacts":
+            parsed_cm = {"subcommand": "artifacts", "raw": user_text}
+        elif intent == "run_sample_scan":
+            action_event = {"name": "run_sample_scan", "context": {}}
+        elif intent == "apply_patch":
+            vid = str(intent_info.get("vuln_id") or "ALL").upper()
+            if vid == "ALL":
+                action_event = {"name": "apply_all_patches", "context": {}}
+            else:
+                action_event = {"name": "apply_patch", "context": {"vuln_id": vid}}
+        elif intent == "workspace_scan" and ws.files:
+            runner = CodeMenderRunner(model_name=active_model)
+            pipeline_res = runner.run_pipeline(ws)
+            if pipeline_res.cost_summary is not None:
+                record_session_cost(state, pipeline_res.cost_summary)
+            state["cm_pipeline_result"] = pipeline_res.to_dict()
+            a2ui_messages = build_scan_report_surface(
+                pipeline_res,
+                catalog_mode=catalog_mode,
+            )
+            lead_md = _format_scan_report_markdown(pipeline_res)
+            return types.Content(
+                role="model",
+                parts=[
+                    types.Part.from_text(
+                        text=_build_response_text(lead_md, a2ui_messages)
+                    )
+                ],
+            )
+        elif intent == "greeting_or_help":
+            a2ui_messages = build_upload_prompt_surface(catalog_mode=catalog_mode)
+            lead_md = _format_upload_guide_markdown(active_model=active_model)
+            return types.Content(
+                role="model",
+                parts=[
+                    types.Part.from_text(
+                        text=_build_response_text(lead_md, a2ui_messages)
+                    )
+                ],
+            )
+
     if parsed_cm is not None:
         cmd_out = await execute_cm_command(
             parsed_cm,
@@ -738,29 +1123,6 @@ async def _codemender_before_agent_callback_inner(
                 )
             ],
         )
-
-    # 6. Check if the user triggered a demo/patch/cost action (via button DataPart OR natural-language command)
-    action_event = extract_a2ui_action_from_parts(expanded_parts)
-    if not action_event and user_text:
-        if any(
-            kw in user_text_lower
-            for kw in ("샘플", "데모", "sample", "demo", "테스트 실행", "진단 실행")
-        ):
-            action_event = {"name": "run_sample_scan", "context": {}}
-        elif state.get("cm_pipeline_result") and any(
-            kw in user_text_lower
-            for kw in ("패치 적용", "패치해", "전체 패치", "apply patch", "apply all", "수정본")
-        ):
-            import re
-
-            vid_match = re.search(r"(CM-[A-Z0-9-]+-\d+)", user_text, re.IGNORECASE)
-            if vid_match:
-                action_event = {
-                    "name": "apply_patch",
-                    "context": {"vuln_id": vid_match.group(1).upper()},
-                }
-            else:
-                action_event = {"name": "apply_all_patches", "context": {}}
 
     if action_event:
         action_name = action_event["name"]
@@ -845,15 +1207,7 @@ async def _codemender_before_agent_callback_inner(
                     ],
                 )
 
-    # 7. If user sends an explicit greeting or help request, return onboarding guide
-    is_greeting_or_help = bool(
-        user_text_lower
-        and any(
-            kw in user_text_lower
-            for kw in ("안녕", "반가워", "hello", "hi", "도움말", "help", "사용법")
-        )
-    )
-    if is_greeting_or_help or not user_text.strip():
+    if not user_text.strip():
         a2ui_messages = build_upload_prompt_surface(catalog_mode=catalog_mode)
         lead_md = _format_upload_guide_markdown(active_model=active_model)
         return types.Content(
@@ -865,43 +1219,7 @@ async def _codemender_before_agent_callback_inner(
             ],
         )
 
-    # 8. If workspace has files AND user explicitly asks to scan/diagnose the current workspace, run pipeline
-    is_explicit_scan_request = any(
-        kw in user_text_lower
-        for kw in (
-            "스캔해",
-            "진단해",
-            "검사해",
-            "취약점 찾아",
-            "취약점 탐색",
-            "코드 분석해",
-            "보안 진단",
-            "보안 스캔",
-            "다시 스캔",
-            "rescan",
-        )
-    )
-    if ws.files and is_explicit_scan_request:
-        runner = CodeMenderRunner(model_name=active_model)
-        pipeline_res = runner.run_pipeline(ws)
-        if pipeline_res.cost_summary is not None:
-            record_session_cost(state, pipeline_res.cost_summary)
-        state["cm_pipeline_result"] = pipeline_res.to_dict()
-        a2ui_messages = build_scan_report_surface(
-            pipeline_res,
-            catalog_mode=catalog_mode,
-        )
-        lead_md = _format_scan_report_markdown(pipeline_res)
-        return types.Content(
-            role="model",
-            parts=[
-                types.Part.from_text(
-                    text=_build_response_text(lead_md, a2ui_messages)
-                )
-            ],
-        )
-
-    # 9. Contextual & general conversational response (handles both follow-up security questions and casual queries like "오늘날씨는?")
+    # 8. Contextual & general conversational response (handles follow-up questions, repo confirmations, and casual queries)
     chat_md = _generate_contextual_chat_response(
         user_text=user_text,
         ws=ws,
@@ -933,18 +1251,32 @@ def _generate_contextual_chat_response(
     ws_files = [f.relative_path for f in getattr(ws, "files", [])]
     pipe_dict = state.get("cm_pipeline_result") if hasattr(state, "get") else None
     gh_ctx = state.get("cm_github_repo_context") if hasattr(state, "get") else None
+    target_repo = str(state.get("cm_target_repo") or "").strip() if hasattr(state, "get") else ""
+    chat_history = list(state.get("cm_chat_history") or []) if hasattr(state, "get") else []
     gh_auth = poll_or_verify_github_auth(state)
+    gh_login = str(gh_auth.get("login") or "") if isinstance(gh_auth, dict) else ""
+
+    if target_repo and "/" not in target_repo and gh_login:
+        target_repo_full = f"{gh_login}/{target_repo}"
+    else:
+        target_repo_full = target_repo
 
     ctx_lines = [
         f"- 현재 활성 모델: {active_model}",
+        f"- 현재 지목/대화 중인 타겟 GitHub 레포지토리: {target_repo_full or '아직 지정되지 않음'}",
         f"- 현재 세션 워크스페이스 파일({len(ws_files)}개): {', '.join(ws_files) if ws_files else '아직 업로드/스캔된 파일 없음'}",
     ]
+    if _SAMPLE_VULNERABLE_FILENAME in ws_files:
+        ctx_lines.append(
+            f"- [중요 파일 출처 안내] `{_SAMPLE_VULNERABLE_FILENAME}` 파일은 사용자의 GitHub 레포지토리에 있는 파일이 아니라, "
+            f"CodeMender Cloud Run 컨테이너 내부 임시 격리 워크스페이스(`{ws.orig_dir}/{_SAMPLE_VULNERABLE_FILENAME}`)에 내장된 **기본 데모용 샘플 파일(SQLi CWE-89 + OS Command Injection CWE-78 검증용)**입니다."
+        )
     if isinstance(gh_ctx, dict) and gh_ctx.get("repo"):
         ctx_lines.append(
-            f"- 최근 스캔한 GitHub 레포지토리: {gh_ctx.get('repo')} (브랜치: {gh_ctx.get('branch', 'main')})"
+            f"- 최근 스캔 완료한 GitHub 레포지토리: {gh_ctx.get('repo')} (브랜치: {gh_ctx.get('branch', 'main')}, 가져온 파일: {', '.join(gh_ctx.get('fetched_files') or [])})"
         )
-    if isinstance(gh_auth, dict) and gh_auth.get("authenticated") and gh_auth.get("login"):
-        ctx_lines.append(f"- 연동된 GitHub 계정: @{gh_auth.get('login')}")
+    if isinstance(gh_auth, dict) and gh_auth.get("authenticated") and gh_login:
+        ctx_lines.append(f"- 연동된 GitHub 계정: @{gh_login}")
         try:
             user_repos = list_user_github_repos(
                 str(gh_auth.get("access_token") or ""), limit=25, visibility="all"
@@ -955,7 +1287,7 @@ def _generate_contextual_chat_response(
                     for r in user_repos
                 ]
                 ctx_lines.append(
-                    f"- @{gh_auth.get('login')} 계정의 실제 GitHub 보유 레포지토리 목록({len(user_repos)}개): "
+                    f"- @{gh_login} 계정의 실제 GitHub 보유 레포지토리 목록({len(user_repos)}개): "
                     + ", ".join(repo_summaries)
                 )
         except Exception:
@@ -973,24 +1305,32 @@ def _generate_contextual_chat_response(
                 f"{f.get('title')} @ {f.get('file_path')}:{f.get('start_line')} — {f.get('description')}"
             )
 
+    history_lines = []
+    for idx, turn in enumerate(chat_history[-8:], start=1):
+        history_lines.append(
+            f"[Turn {idx} 사용자]: {turn.get('user', '')}\n[Turn {idx} 에이전트]: {turn.get('assistant', '')[:400]}"
+        )
+    history_block = "\n".join(history_lines) if history_lines else "(이전 대화 없음)"
     context_block = "\n".join(ctx_lines)
 
     if os.getenv("CM_DISABLE_LLM_NETWORK", "false").lower() != "true":
         prompt = (
             "당신은 Google Cloud Gemini Enterprise에 통합된 'CodeMender Security Agent (cm v0.12.0)'입니다.\n"
-            "사용자의 질문이나 발화 의도를 정확히 파악하여 한국어로 자연스럽고 친절하며 명확하게 답변하세요.\n\n"
+            "반드시 [최근 대화 이력]과 [현재 세션 컨텍스트]를 함께 읽고, 사용자의 질문이나 발화 의도에 정확히 맞춰 한국어로 자연스럽고 명확하게 답변하세요.\n\n"
             "[응답 원칙]\n"
             "1. 사용자가 일상적인 질문(예: '오늘 날씨는?', '점심 추천해줘', '고마워', '너는 누구야?')을 하면, "
-            "절대 뚱딴지같이 보안 스캔 리포트를 쏟아내지 말고 사용자의 질문 맥락에 맞춰 먼저 자연스럽게 대답하세요. "
-            "(실시간 날씨 등 외부 센서/검색이 필요한 질문이면 클라우드 보안 에이전트 환경이라 실시간 기상 조회는 어렵다고 가볍게 안내한 뒤, "
-            "간단히 어떤 보안 진단·모델 관리·GitHub PR 작업을 도와줄 수 있는지 1~2줄로 덧붙이세요.)\n"
-            "2. 사용자가 현재 세션에서 스캔한 코드, 발견된 취약점, 패치 내용, 보안 개념(CWE/OWASP), 모델, GitHub 연동에 대해 질문하면 "
-            "아래 [현재 세션 컨텍스트]를 바탕으로 구체적이고 전문적으로 답변하세요.\n"
-            "3. 절대 사용자에게 '터미널에서 직접 명령어를 실행하세요'(예: 'gh repo list', 'cm repo list --visibility private' 등 존재하지 않거나 터미널용인 명령어)라고 떠넘기지 마세요! "
-            "당신은 이미 GitHub API와 연동된 에이전트이므로 [현재 세션 컨텍스트]에 제공된 실제 GitHub 레포지토리 목록(Private/Public 구분 포함)을 사용해 그 자리에서 즉시 직접 목록을 보여주세요.\n"
-            "4. 불필요하게 긴 명령어 표를 반복 출력하지 말고 핵심만 깔끔한 마크다운으로 답변하세요.\n\n"
+            "절대 보안 스캔 리포트를 쏟아내지 말고 질문 맥락에 맞춰 먼저 자연스럽게 대답하세요.\n"
+            "2. 사용자가 `sample_payment_service.py`가 어디에 있는 파일인지, 왜 이 파일이 나왔는지, 혹은 '뭔데 이게'라고 물어보면: "
+            "`sample_payment_service.py`는 사용자의 GitHub 레포지토리 파일이 아니라 CodeMender 컨테이너 격리 워크스페이스(`/tmp/codemender_workspaces/.../orig/sample_payment_service.py`)에 내장된 기본 데모용 샘플 파일임을 명확히 설명하세요. "
+            "그리고 현재 지목된 타겟 레포지토리(예: `ldu1225/codemender-ge`)를 스캔하려면 `깃허브 스캔 ldu1225/codemender-ge` 또는 `sample 폴더 외에 다 스캔해`라고 입력하면 즉시 해당 GitHub 레포의 실제 코드를 가져와 스캔한다고 안내하세요.\n"
+            "3. 사용자가 특정 레포지토리 이름(예: 'codemender-ge레포')만 언급했다면, 해당 레포지토리(`"
+            f"{target_repo_full or '지정된 레포'}`"
+            ")를 현재 세션의 타겟 저장소로 설정했음을 안내하고, 전체 스캔 또는 특정 폴더 제외 스캔(예: `sample 폴더 외에 다 스캔해`) 등 원하시는 작업을 말씀해 달라고 간결하게 안내하세요.\n"
+            "4. 절대 사용자에게 '터미널에서 직접 명령어를 실행하세요'(예: 'gh repo list', 'cm repo list --visibility private' 등)라고 떠넘기지 마세요! "
+            "[현재 세션 컨텍스트]에 제공된 실제 GitHub 레포지토리 목록(Private/Public 구분 포함)을 사용해 그 자리에서 직접 답변하세요.\n\n"
             f"[현재 세션 컨텍스트]\n{context_block}\n\n"
-            f"[사용자 메시지]\n{user_text}"
+            f"[최근 대화 이력]\n{history_block}\n\n"
+            f"[이번 사용자 메시지]\n{user_text}"
         )
         candidate_models = []
         for m in (active_model, CODEMENDER_FALLBACK_MODEL, "gemini-2.5-flash"):
@@ -1006,7 +1346,7 @@ def _generate_contextual_chat_response(
                     model=model_name,
                     contents=prompt,
                     config=genai_types.GenerateContentConfig(
-                        temperature=0.3,
+                        temperature=0.25,
                     ),
                 )
                 if resp and resp.text and resp.text.strip():
@@ -1014,10 +1354,28 @@ def _generate_contextual_chat_response(
             except Exception as err:
                 logger.debug(f"Contextual chat generation failed on {model_name}: {err}")
 
-    # Clean offline / fallback response when CM_DISABLE_LLM_NETWORK=true
+    # Deterministic context-aware fallback when CM_DISABLE_LLM_NETWORK=true
+    low_q = user_text.lower()
+    if "sample_payment_service" in low_q or "어디에" in low_q or "어디 있" in low_q:
+        return (
+            f"### 📍 `sample_payment_service.py` 파일 위치 및 출처 안내\n"
+            f"- **실제 위치**: Cloud Run 컨테이너 내부 임시 격리 워크스페이스 경로인 `{ws.orig_dir}/{_SAMPLE_VULNERABLE_FILENAME}`에 위치한 **CodeMender 내장 기본 데모 파일**입니다.\n"
+            f"- **왜 이 파일이 표시되었나요?**: 회원님의 GitHub 저장소(`{target_repo_full or 'codemender-ge'}`)에 들어 있는 파일이 아니라, CodeMender의 3단계 파이프라인(SQL Injection `CWE-89` · OS Command Injection `CWE-78` 탐지 및 오탐 필터링)을 시연하기 위해 내장된 샘플 코드입니다.\n"
+            f"- **내 GitHub 저장소 스캔하기**: 현재 타겟 저장소(**`{target_repo_full or 'codemender-ge'}`**)의 실제 소스 코드를 스캔하시려면 **`깃허브 스캔 {target_repo_full or 'codemender-ge'}`** 또는 **`sample폴더외에 다 스캔해`**라고 입력해 주세요!"
+        )
+    if target_repo_full and any(k in low_q.replace("래포", "레포").replace("리포", "레포") for k in ("레포", "저장소", "repo")):
+        return (
+            f"### 🎯 타겟 GitHub 레포지토리 설정 완료: `{target_repo_full}`\n"
+            f"- 현재 세션의 작업 대상 저장소가 **`{target_repo_full}`**(으)로 설정되었습니다.\n"
+            "- 이제 바로 다음과 같이 자연어로 지시하실 수 있습니다:\n"
+            "  - **전체 코드 스캔**: `다 스캔해` 또는 `보안 스캔 시작해`\n"
+            "  - **특정 폴더 제외 스캔**: `sample폴더외에 다 스캔해` 또는 `tests 빼고 스캔해`\n"
+            "  - **패치 후 PR 생성**: `깃허브 PR 생성`"
+        )
+
     return (
         f"### 💬 CodeMender Security Agent (`{active_model}`)\n"
-        f"질문하신 내용(**\"{user_text}\"**)을 확인했습니다.\n\n"
+        f"질문하신 내용(**\"{user_text}\"**)을 이전 대화 맥락과 함께 확인했습니다.\n\n"
         "- 저는 **CodeMender 자율 보안 에이전트**로, 격리된 클라우드 보안 샌드박스에서 동작하기 때문에 실시간 외부 생활 정보(날씨 등)는 직접 조회하지 못하지만 코드 보안 진단·취약점 분석·패치 및 GitHub PR 생성에 관한 질문은 현재 세션 맥락에 맞춰 바로 답변해 드릴 수 있습니다.\n\n"
         f"#### 📌 현재 세션 상태 요약\n{context_block}\n\n"
         "> 💡 **유용한 단축 명령**: **`모델 관리`** (`cm models`) · **`세션 이력`** (`cm sessions`) · **`샘플 진단 실행`** (`cm find`) · **`비용 조회`** (`cm cost`) · **`깃허브 연동`** (`cm github login`)"

@@ -470,6 +470,7 @@ def fetch_github_repo_files_into_workspace(
     repo_full_name: str,
     workspace: WorkspaceContext,
     subpath: str = "",
+    exclude_paths: list[str] | None = None,
     branch: str = "",
     max_files: int = 8,
     state: Any = None,
@@ -486,6 +487,22 @@ def fetch_github_repo_files_into_workspace(
                 subpath = "/".join(parts[4:])
             else:
                 subpath = "/".join(parts[2:])
+
+    normalized_excludes: list[str] = []
+    for raw_ex in exclude_paths or []:
+        ex_clean = str(raw_ex or "").strip().strip("/").lower()
+        if not ex_clean:
+            continue
+        if ex_clean not in normalized_excludes:
+            normalized_excludes.append(ex_clean)
+        if ex_clean.endswith("s") and len(ex_clean) > 2:
+            singular = ex_clean[:-1]
+            if singular not in normalized_excludes:
+                normalized_excludes.append(singular)
+        else:
+            plural = f"{ex_clean}s"
+            if plural not in normalized_excludes:
+                normalized_excludes.append(plural)
 
     if os.getenv("CM_DISABLE_LLM_NETWORK", "false").lower() == "true":
         sample_code = (
@@ -504,6 +521,7 @@ def fetch_github_repo_files_into_workspace(
             "status": "ok",
             "repo": clean_repo,
             "branch": branch or "main",
+            "excluded_paths": normalized_excludes,
             "fetched_files": ["github_service.py"],
             "file_shas": {"github_service.py": "mock_sha_12345"},
         }
@@ -549,7 +567,16 @@ def fetch_github_repo_files_into_workspace(
                 if not isinstance(item, dict) or item.get("type") != "blob":
                     continue
                 p_str = str(item.get("path") or "")
+                p_low = p_str.lower()
+                p_segments = p_low.split("/")
                 if subpath and not p_str.startswith(subpath.strip("/")):
+                    continue
+                if normalized_excludes and any(
+                    ex in p_segments
+                    or p_low.startswith(f"{ex}/")
+                    or p_low == ex
+                    for ex in normalized_excludes
+                ):
                     continue
                 ext = Path(p_str).suffix.lower()
                 # Prioritize code files over config/markdown files
@@ -618,6 +645,7 @@ def fetch_github_repo_files_into_workspace(
         "owner": repo_owner,
         "can_push": can_push,
         "branch": target_branch,
+        "excluded_paths": normalized_excludes,
         "html_url": repo_meta.get("html_url", f"https://github.com/{clean_repo}"),
         "fetched_files": fetched_files,
         "file_shas": file_shas,

@@ -218,6 +218,108 @@ def resolve_finding_id(
     return token
 
 
+_NON_REPO_SLASH_TOKENS = {
+    "cwe",
+    "owasp",
+    "usd",
+    "krw",
+    "in",
+    "out",
+    "think",
+    "orig",
+    "patched",
+    "app",
+    "tests",
+    "test",
+    "src",
+    "samples",
+    "sample",
+    "docs",
+    "scripts",
+    "bin",
+    "http",
+    "https",
+    "github.com",
+    "v1",
+    "v2",
+}
+
+_NON_REPO_NAME_TOKENS = {
+    "github",
+    "gh",
+    "my",
+    "private",
+    "public",
+    "all",
+    "list",
+    "scan",
+    "pr",
+    "cm",
+    "repo",
+    "repos",
+    "repository",
+}
+
+
+def extract_exclude_paths_from_text(user_text: str) -> list[str]:
+    """Extracts folder or file paths that the user asked to exclude from scanning (e.g., 'sample폴더외에 다 스캔해')."""
+    if not user_text:
+        return []
+    found: list[str] = []
+    patterns = [
+        r"([A-Za-z0-9_./-]+)\s*(?:폴더|디렉터리|디렉토리|파일|경로)?\s*(?:외에|외엔|외의|제외하고|제외한|제외|빼고|말고)",
+        r"(?:exclude|excluding|except|without)\s+([A-Za-z0-9_./-]+)",
+    ]
+    ignore_words = {"폴더", "디렉터리", "디렉토리", "파일", "코드", "전체", "다", "모두", "전부"}
+    for pat in patterns:
+        for match in re.finditer(pat, user_text, re.IGNORECASE):
+            cand = match.group(1).strip().strip("/").strip("'\"`")
+            if cand and cand.lower() not in ignore_words and cand not in found:
+                found.append(cand)
+    return found
+
+
+def extract_target_repo_from_text(user_text: str) -> str | None:
+    """Extracts a GitHub repository (`owner/repo` or `<repo_name>레포`) mentioned in user text."""
+    if not user_text:
+        return None
+    # 1. Full GitHub URL (excluding pull/issues links handled separately)
+    url_m = re.search(
+        r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)",
+        user_text,
+    )
+    if url_m:
+        cand = url_m.group(1).rstrip("/")
+        if cand.endswith(".git"):
+            cand = cand[:-4]
+        return cand
+
+    # 2. Explicit `<repo_name> 레포 / 저장소 / repo` (e.g., 'codemender-ge레포', 'codemender-ge 저장소')
+    named_m = re.search(
+        r"(?<![A-Za-z0-9_/-])([A-Za-z0-9][A-Za-z0-9_.-]{1,})\s*(?:레포지토리|레포|래포|리포|저장소|repository|repo)(?![A-Za-z0-9_])",
+        user_text,
+        re.IGNORECASE,
+    )
+    if named_m:
+        cand = named_m.group(1).strip("`'\"")
+        if cand.lower() not in _NON_REPO_NAME_TOKENS:
+            return cand
+
+    # 3. `owner/repo` pattern
+    for slash_m in re.finditer(
+        r"(?<![A-Za-z0-9_.:/-])([A-Za-z0-9_.-]{2,})/([A-Za-z0-9_.-]{2,})(?![A-Za-z0-9_./-])",
+        user_text,
+    ):
+        left, right = slash_m.group(1), slash_m.group(2)
+        if (
+            left.lower() not in _NON_REPO_SLASH_TOKENS
+            and right.lower() not in _NON_REPO_SLASH_TOKENS
+            and not right.lower().endswith((".py", ".js", ".ts", ".go", ".java", ".json", ".md"))
+        ):
+            return f"{left}/{right}"
+    return None
+
+
 def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
     """Parses explicit `cm <subcmd> ...` or Korean natural-language equivalents."""
     if not user_text or not user_text.strip():
@@ -253,6 +355,8 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
         .replace("깃레포", "깃허브 레포")
         .replace("깃허브레포", "깃허브 레포")
     )
+    exclude_paths = extract_exclude_paths_from_text(un_fenced)
+    mentioned_repo = extract_target_repo_from_text(un_fenced)
 
     visibility_filter = "all"
     if any(k in full_lower for k in ("프라이빗", "비공개", "private")):
@@ -337,6 +441,11 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
             elif tok in ("-f", "--format") and i + 1 < len(rest):
                 fmt = rest[i + 1].lower()
                 i += 2
+            elif tok_low in ("--exclude", "-x") and i + 1 < len(rest):
+                for ex_item in rest[i + 1].split(","):
+                    if ex_item.strip():
+                        exclude_paths.append(ex_item.strip())
+                i += 2
             elif tok_low in ("--visibility", "-v") and i + 1 < len(rest):
                 v_val = rest[i + 1].lower().strip()
                 if v_val in ("private", "public", "all"):
@@ -388,6 +497,7 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
             "subcommand": sub,
             "positional": positional,
             "visibility": visibility_filter,
+            "exclude_paths": exclude_paths,
             "model": model_override,
             "extra_context": extra_context,
             "format": fmt,
@@ -415,6 +525,22 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
             if k_low in lower or (k_ns and k_ns in no_space):
                 return True
         return False
+
+    # Guardrail: If the user is asking an explanatory question about a file/output (e.g. "대상 파일: sample_payment_service.py 이게지금어디에있는건데", "뭔데 이게"),
+    # do NOT misroute to a CLI subcommand.
+    if _matches(
+        "대상 파일:",
+        "어디에있는건데",
+        "어디에 있는건데",
+        "이게지금어디",
+        "뭔데 이게",
+        "이게 뭔데",
+        "이게 뭐야",
+        "무슨 파일이",
+        "왜 이래",
+        "왜 이런",
+    ):
+        return None
 
     if _matches("cm 명령어", "명령어 목록", "전체 기능", "무슨 기능", "기능 목록", "명령어 가이드"):
         return {"subcommand": "help", "raw": first_line}
@@ -514,12 +640,12 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
         "생성된 파일",
         "다운로드",
         "download",
-        "어디에 저장",
-        "어디 있",
-        "저장 위치",
-        "저장된",
         "수정한 파일",
         "수정된 파일",
+        "패치된 파일",
+        "패치 파일 저장",
+        "어디에 저장",
+        "저장 위치",
         "artifacts",
     ):
         return {"subcommand": "artifacts", "raw": first_line}
@@ -662,7 +788,9 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
         )
     ):
         pos = ["pr"]
-        if gh_repo_match:
+        if mentioned_repo:
+            pos.append(mentioned_repo)
+        elif gh_repo_match:
             pos.append(gh_repo_match.group(1))
         return {"subcommand": "github", "positional": pos, "raw": first_line}
 
@@ -680,26 +808,31 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
         )
         or ("https://github.com/" in lower and "pull" not in lower)
         or (
-            gh_repo_match
+            mentioned_repo
             and not first_line.lower().startswith("cm ")
             and _matches("스캔", "진단", "분석", "검사", "scan", "check", "audit")
         )
     ):
         pos = ["scan"]
-        if gh_repo_match:
+        if mentioned_repo:
+            pos.append(mentioned_repo)
+        elif gh_repo_match:
             pos.append(gh_repo_match.group(1))
-        return {"subcommand": "github", "positional": pos, "raw": first_line}
+        return {
+            "subcommand": "github",
+            "positional": pos,
+            "exclude_paths": exclude_paths,
+            "raw": first_line,
+        }
 
     if _matches(
         "깃허브 로그인",
         "깃허브 연동",
         "깃허브 인증",
         "깃허브 연결",
-        "깃허브",
         "github login",
         "github auth",
-        "github",
-    ):
+    ) or lower.strip() in ("깃허브", "github"):
         return {"subcommand": "github", "positional": ["login"], "raw": first_line}
 
     if _matches(
@@ -2200,6 +2333,20 @@ async def execute_cm_command(
         # 13b. `cm github scan <owner/repo> [subpath]`
         if gh_action in ("scan", "clone"):
             if not gh_args:
+                ctx_repo = str(
+                    parsed_cmd.get("target_repo")
+                    or (state.get("cm_target_repo") if hasattr(state, "get") else "")
+                    or (
+                        (state.get("cm_github_repo_context") or {}).get("repo")
+                        if hasattr(state, "get")
+                        and isinstance(state.get("cm_github_repo_context"), dict)
+                        else ""
+                    )
+                    or ""
+                ).strip()
+                if ctx_repo:
+                    gh_args = [ctx_repo]
+            if not gh_args:
                 repos = list_user_github_repos(token, limit=5)
                 example_repo = repos[0]["full_name"] if repos else f"{gh_login}/my-repo"
                 return {
@@ -2210,7 +2357,11 @@ async def execute_cm_command(
                     )
                 }
             target_repo = gh_args[0]
-            subpath = gh_args[1] if len(gh_args) > 1 else ""
+            subpath = str(parsed_cmd.get("subpath") or (gh_args[1] if len(gh_args) > 1 else "")).strip()
+            exclude_paths = list(
+                parsed_cmd.get("exclude_paths")
+                or extract_exclude_paths_from_text(str(parsed_cmd.get("raw") or ""))
+            )
             if "/" not in target_repo and not target_repo.startswith("https://"):
                 target_repo = f"{gh_login}/{target_repo}"
 
@@ -2219,6 +2370,7 @@ async def execute_cm_command(
                 repo_full_name=target_repo,
                 workspace=workspace,
                 subpath=subpath,
+                exclude_paths=exclude_paths,
                 state=state,
             )
             if fetch_res.get("status") != "ok":
@@ -2228,6 +2380,7 @@ async def execute_cm_command(
 
             state["cm_workspace"] = workspace.to_dict()
             state["cm_github_repo_context"] = fetch_res
+            state["cm_target_repo"] = fetch_res["repo"]
 
             runner = CodeMenderRunner(model_name=active_model)
             pipeline_res = runner.run_pipeline(workspace)
@@ -2262,9 +2415,15 @@ async def execute_cm_command(
                     f"- **🔒 외부 저장소 권한 안내**: `{fetch_res['repo']}`는 외부 타인(`@{repo_owner}`) 소유 저장소로 현재 계정(`@{gh_login}`)에는 **읽기 전용(Read-Only)** 권한만 있습니다. "
                     f"타인 저장소에는 직접 브랜치/PR을 생성할 수 없으므로, **`패치 적용`** 후 **`다운로드`**(`cm artifacts`)로 수정본을 받으시거나 본인 계정으로 **Fork**한 뒤 PR을 생성해 주세요.\n\n---\n\n"
                 )
+            excluded_line = ""
+            if fetch_res.get("excluded_paths"):
+                excluded_line = (
+                    f"- **제외된 경로 필터**: `{', '.join(fetch_res['excluded_paths'])}` 디렉터리/파일 제외 적용됨\n"
+                )
             header_md = (
                 f"### 🐙 GitHub 레포지토리 실시간 연동 스캔 완료: [`{fetch_res['repo']}`]({fetch_res.get('html_url', '')}) (브랜치: `{fetch_res['branch']}`)\n"
                 f"- **GitHub 계정**: `@{gh_login}` | **가져온 소스 파일 ({len(fetch_res['fetched_files'])}개)**: `{', '.join(fetch_res['fetched_files'])}`\n"
+                + excluded_line
                 + pr_guide_line
             )
             return {
