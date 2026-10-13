@@ -1301,7 +1301,7 @@ async def execute_cm_command(
             lines.extend(
                 [
                     "",
-                    "💡 **Security Gate 통과 방법**: 채팅창에 **`cm fix ALL`** (또는 **`패치 적용`**)을 입력하여 모든 CRITICAL/HIGH 취약점을 패치한 뒤 다시 **`cm triage`**를 실행하세요.",
+                    "💡 **Security Gate 통과 방법**: 채팅창에 **`cm fix ALL`** (또는 **`패치 적용`**)을 입력하여 모든 CRITICAL/HIGH 취약점을 패치한 뒤 다시 `cm triage`를 실행하세요.",
                 ]
             )
         elapsed = int((time.monotonic() - t0) * 1000) + 15
@@ -1351,7 +1351,7 @@ async def execute_cm_command(
                     "markdown": (
                         "### 📝 `cm vcs diff` — 변경 사항 없음 (`CLEAN`)\n"
                         "- 현재 워크스페이스에 적용된 패치가 없어 원본(`orig/`)과 동일합니다.\n"
-                        "- 먼저 **`cm fix ALL`** 또는 **`패치 적용`**을 실행해 보세요."
+                        "- 먼저 **`cm fix ALL`** 또는 `패치 적용`을 실행해 보세요."
                         + cost_footer
                     )
                 }
@@ -1841,7 +1841,7 @@ async def execute_cm_command(
             f"### 📦 `cm artifacts` / `cm download` — 수정된 파일 실제 저장 위치 및 원클릭 다운로드 (`{workspace.workspace_id}`)",
             "> 💡 **왜 이전에는 다운로드가 안 되었나요?**  ",
             "> Cloud Run 컨테이너 내부 임시 격리 디스크(`/tmp/codemender_workspaces/...`)와 ADK 인메모리 아티팩트 스토어에만 저장되어 있으면 Gemini Enterprise 웹 UI에서 직접 클릭해 내려받을 수 없습니다.  ",
-            f"> 이제 모든 패치 작업본과 ZIP 패키지를 **Google Cloud Storage 영구 버킷 (`gs://{GCS_ARTIFACT_BUCKET}/codemender-patches/...`)**에 자동 동기화하여 **브라우저 원클릭 다운로드 링크**와 **전체 수정본 코드 전문**을 함께 제공합니다!",
+            f"> 이제 모든 패치 작업본과 ZIP 패키지를 **Google Cloud Storage 영구 버킷**(`gs://{GCS_ARTIFACT_BUCKET}/codemender-patches/...`)에 자동 동기화하여 **브라우저 원클릭 다운로드 링크**와 **전체 수정본 코드 전문**을 함께 제공합니다!",
             "",
             "#### 1️⃣ 📥 원클릭 브라우저 직접 다운로드 & 3중 저장소 경로",
             "| 구분 | 파일명 | 1️⃣ 원클릭 직접 다운로드 (클릭) | 2️⃣ Google Cloud Storage 영구 경로 (`gs://`) | 3️⃣ Cloud Run 컨테이너 경로 |",
@@ -1925,7 +1925,7 @@ async def execute_cm_command(
         lines.extend(
             [
                 "",
-                "💡 **모델 전환 방법**: 채팅창에 **`cm switch-model gemini-3.8-flash-cyber`** 또는 **`cm find --model gemini-3.7-flash`**처럼 입력하세요.",
+                "💡 **모델 전환 방법**: 채팅창에 **`cm switch-model gemini-3.8-flash-cyber`** 또는 `cm find --model gemini-3.7-flash`처럼 입력하세요.",
             ]
         )
         return {"markdown": "\n".join(lines) + cost_footer}
@@ -1950,7 +1950,7 @@ async def execute_cm_command(
                 "markdown": (
                     "### 🔒 `cm github logout` — GitHub 계정 연동 해제 완료\n"
                     "- 저장된 GitHub OAuth 토큰 및 세션 인증 정보가 안전하게 삭제되었습니다.\n"
-                    "- 다시 연동하시려면 채팅창에 **`깃허브 로그인`** 또는 **`cm github login`**을 입력하세요."
+                    "- 다시 연동하시려면 채팅창에 **`깃허브 로그인`** 또는 `cm github login`을 입력하세요."
                 )
             }
 
@@ -1997,9 +1997,9 @@ async def execute_cm_command(
             lines = [
                 "### 🔗 `cm github login --force` — 새 GitHub OAuth 기기 인증 코드 발급",
                 f"1. **👉 [GitHub 기기 인증 페이지 열기 (`{v_uri}`)]({v_uri})**",
-                "2. 아래 **8자리 인증 코드**를 입력하고 **`[Authorize]`**를 클릭하세요:",
+                "2. 아래 **8자리 인증 코드**를 입력하고 `[Authorize]`를 클릭하세요:",
                 f"```text\n{u_code}\n```",
-                "3. 승인 후 채팅창에 **`깃허브 인증 완료`**라고 입력해 주세요.",
+                "3. 승인 후 채팅창에 `깃허브 인증 완료`라고 입력해 주세요.",
             ]
             return {"markdown": "\n".join(lines)}
 
@@ -2014,7 +2014,7 @@ async def execute_cm_command(
                         f"아직 GitHub에서 코드 승인이 완료되지 않았습니다.\n\n"
                         f"1. **👉 [GitHub 기기 인증 페이지 열기 (`{v_uri}`)]({v_uri})**\n"
                         f"2. 인증 코드 입력: **`{u_code}`** → **`[Authorize]`** 클릭\n"
-                        "3. 승인 직후 채팅창에 다시 **`깃허브 인증 완료`** 또는 **`내 레포 목록`**을 입력해 주세요!"
+                        "3. 승인 직후 채팅창에 다시 **`깃허브 인증 완료`** 또는 `내 레포 목록`을 입력해 주세요!"
                     )
                 }
             flow = start_github_device_flow(state)
@@ -2025,9 +2025,9 @@ async def execute_cm_command(
                     "### 🔐 GitHub 계정 인증이 필요합니다 (`cm github login`)\n"
                     "내 GitHub 레포지토리 조회·스캔 및 자동 PR 생성을 위해 먼저 1회 인증을 진행해 주세요:\n\n"
                     f"1. **👉 [여기를 클릭해 GitHub 기기 인증 페이지 열기 (`{v_uri}`)]({v_uri})**\n"
-                    f"2. 화면에 아래 8자리 인증 코드를 입력하고 **`[Authorize]`**를 클릭하세요:\n"
+                    f"2. 화면에 아래 8자리 인증 코드를 입력하고 `[Authorize]`를 클릭하세요:\n"
                     f"```text\n{u_code}\n```\n"
-                    "3. 승인 완료 후 채팅창에 **`깃허브 인증 완료`**라고 입력해 주세요!"
+                    "3. 승인 완료 후 채팅창에 `깃허브 인증 완료`라고 입력해 주세요!"
                 )
             }
 
