@@ -43,9 +43,9 @@
 | **🔍 3-Stage 자율 보안 엔진** | `cm find` → `cm verify` → `cm fix` | 정적/의미론적 스캔(Stage 1) → 샌드박스 AST/데이터흐름 검증으로 오탐(False Positive) 제거(Stage 2) → 상대 들여쓰기 보존 및 `ast.parse` 구문 무결성 검증 패치 합성(Stage 3) |
 | **🔒 멀티유저 세션 완벽 격리** | `session_id` 기반 GitHub 토큰 & 워크스페이스 분리 | 다수의 임직원이 동시에 사용해도 사용자 A의 개인 GitHub OAuth 토큰과 스캔 코드가 사용자 B에게 절대 노출되지 않으며, Cloud Run 오토스케일링 시에도 세션별 GCS 스냅샷으로 무중단 복원 |
 | **🐙 GitHub OAuth · 경로 제외 스캔 · 자율 PR** | 원격 리포지토리 필터 스캔 & Pull Request 자동 오픈 | 비공개/공개 레포 필터 조회(`내 레포 목록 프라이빗만`), 특정 폴더 제외 스캔(`sample폴더외에 다 스캔해`), 외부 타인 레포 권한(`can_push`) 자동 판별 및 보안 PR 자동 생성 |
-| **🖥️ A2A v0.3.0 & A2UI v0.9** | 양방향 인터랙티브 보안 대시보드 | Gemini Enterprise 채팅창 호환 고가독성 Markdown 리포트 + A2UI v0.9 카탈로그(`SeverityBadge`, `CodeDiff`, `PatchApprovalGate`) 동시 방출 |
-| **📥 GCS 원클릭 다운로드** | 패치 완료 파일 & ZIP 패키지 영구 보관 | 컨테이너 임시 디스크(`/tmp`)의 한계를 극복하여 고객의 GCS 버킷(`gs://<PROJECT>-a2a-bucket`)에 자동 동기화 및 브라우저 즉시 다운로드 링크 제공 |
-| **💰 온디맨드 비용 텔레메트리** | Billing API 권한 없이 실시간 비용 정산 | 평소 작업 시에는 화면 노이즈를 만들지 않으며, 사용자가 `오늘 비용 산출해줘` 또는 `cm cost`를 호출할 때만 Cloud Logging과 영구 원장을 대조해 KST 기준 USD·KRW 정산 명세서 출력 |
+| **🖥️ A2A v0.3.0 & A2UI v0.9** | 양방향 인터랙티브 보안 대시보드 | Gemini Enterprise 채팅창 호환 고가독성 Markdown 리포트 + A2UI v0.9 듀얼 카탈로그(`codemender_material`: `MaterialCard`·`MaterialBadge`·`CodeDiff`·`MaterialButton` / `basic`: 표준 BasicCatalog) 동시 방출 |
+| **📥 GCS 원클릭 다운로드** | 패치 완료 파일 & ZIP 패키지 GCS 보관 (7일 후 자동 정리) | 컨테이너 임시 디스크(`/tmp`)의 한계를 극복하여 고객의 GCS 버킷(`gs://<PROJECT>-a2a-bucket`)에 자동 동기화 및 브라우저 즉시 다운로드 링크 제공 |
+| **💰 온디맨드 비용 텔레메트리** | Billing API 권한 없이 실시간 비용 정산 | 평소 작업 시에는 화면 노이즈를 만들지 않으며, 사용자가 `오늘 비용 산출해줘` 또는 `cm cost`를 호출할 때만 Cloud Logging 구조화 로그(`CODEMENDER_COST_TELEMETRY`)와 세션·로컬 원장을 대조해 KST 기준 USD·KRW 정산 명세서 출력 |
 
 ---
 
@@ -78,9 +78,9 @@ flowchart TB
     end
 
     subgraph GCP["☁️ Google Cloud Platform Backend"]
-        GEAP["✨ GEAP (Global)<br/>• gemini-3.8-flash (Primary)<br/>• gemini-3.7-flash (Fallback)<br/>• gemini-3.6-pro (Deep Audit)"]
-        GCS["🪣 Cloud Storage (gs://PROJECT-a2a-bucket)<br/>• /codemender-config/sessions/&lt;session_id&gt;/ (유저별 격리 스냅샷 & 토큰)<br/>• /codemender-patches/ (패치 완료 파일 1-Click 다운로드)<br/>• /codemender-ledger/ (온디맨드 비용 정산 원장)"]
-        Logging["📊 Cloud Logging<br/>• CODEMENDER_COST_TELEMETRY<br/>• Cloud Run Request Latency"]
+        GEAP["✨ GEAP (Global)<br/>• gemini-3.8-flash (Primary)<br/>• gemini-3.8-flash-cyber (보안 특화)<br/>• gemini-3.7-flash (Fallback)"]
+        GCS["🪣 Cloud Storage (gs://PROJECT-a2a-bucket)<br/>• /codemender-config/sessions/&lt;session_id&gt;/ (유저별 격리 스냅샷 & 암호화 토큰 · 1일 후 자동 삭제)<br/>• /codemender-patches/ (패치 완료 파일 1-Click 다운로드 · 7일 후 자동 삭제)"]
+        Logging["📊 Cloud Logging<br/>• CODEMENDER_COST_TELEMETRY (온디맨드 비용 정산 원천)<br/>• Cloud Run Request Latency"]
     end
 
     subgraph GitHub["🐙 GitHub Cloud"]
@@ -91,8 +91,8 @@ flowchart TB
     UserA & UserB <-->|"독립 세션 대화 (session_id 분리)"| Assistant
     Assistant <-->|"IAM roles/run.invoker"| FastAPI
     Harness <-->|"3-Stage 추론 & LLM Judge"| GEAP
-    Agent <-->|"세션별 상태/대화이력/OAuth 토큰 격리 동기화"| GCS
-    Harness <-->|"패치 아티팩트 & 비용 원장 저장"| GCS
+    Agent <-->|"세션별 상태/대화이력/암호화 토큰 격리 동기화"| GCS
+    Harness <-->|"패치 아티팩트 저장"| GCS
     Harness <-->|"구조화 비용 로그 방출/조회"| Logging
     Harness <-->|"유저별 OAuth 토큰 발급"| DeviceFlow
     Harness <-->|"원격 스캔 & 자율 PR 생성"| GHAPI
@@ -161,14 +161,14 @@ flowchart LR
    - 반면 각 사용자가 브라우저(`https://github.com/login/device`)에서 본인의 GitHub 계정으로 로그인해 8자리 코드를 승인하면, GitHub은 **해당 사용자 전용 토큰**(`access_token`: `gho_...`)을 발급합니다.
 2. **`session_id` 바인딩 AES-256-GCM 암호화 저장 (`Zero Plaintext Token at Rest`)**
    - 발급된 GitHub `access_token`과 `device_code`는 로컬 디스크(`/tmp`)나 GCS 버킷에 **절대 평문(Plaintext)으로 저장되지 않습니다.**
-   - PBKDF2-HMAC-SHA256(100,000회 반복)으로 유도된 세션별 전용 키와 `codemender-session:<session_id>` 연관 인증 데이터(AAD)를 사용한 **AES-256-GCM(`cm_aead_v1:...`) 암호문**으로만 저장되며, `session_snapshot.json`에서도 토큰 필드는 완전히 제거(Strip)됩니다.
-   - 따라서 GCP 프로젝트 관리자나 개발자가 GCS 콘솔에서 `github_auth_state.json` 파일을 직접 다운로드해 열어봐도 평문 토큰을 볼 수 없으며, 설령 사용자 A의 암호화 파일을 사용자 B의 세션 경로로 복사하더라도 AAD 불일치로 복호화가 즉시 거부되고 파일이 자동 파기됩니다.
+   - **Secret Manager에 보관된 무작위 256bit 마스터 키**(`codemender-token-encryption-key`, 배포 시 자동 생성)로부터 PBKDF2-HMAC-SHA256(100,000회 반복)으로 유도한 세션별 전용 키와 `codemender-session:<session_id>` 연관 인증 데이터(AAD)를 사용한 **AES-256-GCM(`cm_aead_v1:...`) 암호문**으로만 저장되며, `session_snapshot.json`에서도 토큰 필드는 완전히 제거(Strip)되고 대화 이력 속 토큰 문자열은 `[REDACTED_GITHUB_TOKEN]`으로 마스킹됩니다.
+   - 따라서 GCS 버킷 읽기 권한만으로는 토큰을 복호화할 수 없으며(Secret Manager 접근 권한이 별도로 필요), 설령 사용자 A의 암호화 파일을 사용자 B의 세션 경로로 복사하더라도 AAD 불일치로 복호화가 즉시 거부되고 파일이 자동 파기됩니다.
 3. **Cloud Run 오토스케일링 무중단 스냅샷 복원 (`Rehydration`)**
    - Cloud Run은 무상태(Stateless) 환경이므로 1턴(`스캔해줘`)을 처리한 컨테이너 #1과 2턴(`패치 적용` / `PR 만들어봐`)을 처리하는 컨테이너 #2가 서로 다를 수 있습니다.
    - CodeMender는 매 턴이 시작될 때 현재 `session_id`의 스냅샷을 GCS에서 즉시 복원(Rehydrate)하고, 턴이 끝날 때 변경된 상태를 같은 `session_id` 경로에 덮어쓰기(Overwrite)합니다.
 4. **무한 증식 원천 차단 — 애플리케이션 TTL(12시간) + GCS 버킷 Lifecycle 자동 삭제**
    - **애플리케이션 레벨 TTL & 즉시 물리 삭제**: 모든 세션 스냅샷과 암호화 토큰에는 만료 시각(`expires_at_epoch`, 기본 12시간)이 부여됩니다. 만료된 파일이나 `깃허브 연동 해제` 요청 시 빈 값을 덮어쓰는 것이 아니라 로컬 파일(`unlink`)과 GCS 객체(`HTTP DELETE`)를 **물리적으로 즉시 삭제**합니다. 또한 컨테이너 `/tmp` 내 만료된 세션/워크스페이스 디렉터리도 자동 청소됩니다.
-   - **GCS Bucket Lifecycle 자동 청소**: 배포 스크립트([`scripts/deploy_and_register_ge.sh`](scripts/deploy_and_register_ge.sh))가 버킷에 수명 주기 규칙을 자동 설정하여, `codemender-config/sessions/` 하위 객체는 **생성 1일 후**, `codemender-patches/` 하위 패치 아티팩트는 **생성 7일 후 GCP가 자동으로 영구 삭제**합니다. (단, 비용 정산 원장인 `codemender-ledger/`는 영구 보존됩니다.)
+   - **GCS Bucket Lifecycle 자동 청소**: 배포 스크립트([`scripts/deploy_and_register_ge.sh`](scripts/deploy_and_register_ge.sh))가 버킷에 수명 주기 규칙을 자동 설정하여, `codemender-config/sessions/` 하위 객체는 **생성 1일 후**, `codemender-patches/` 하위 패치 아티팩트는 **생성 7일 후 GCP가 자동으로 영구 삭제**합니다. (비용 정산 데이터는 GCS가 아니라 Cloud Logging 구조화 로그 `CODEMENDER_COST_TELEMETRY`로 추적되므로 Lifecycle 대상이 아닙니다.)
 
 ```mermaid
 flowchart TB
@@ -208,8 +208,8 @@ flowchart TB
 | :--- | :--- | :--- | :---: | :---: |
 | **GitHub OAuth 토큰** (`encrypted_access_token`) | `/tmp/codemender_github_auth_sessions/github_auth_<session_id>.json` | `codemender-config/sessions/<session_id>/github_auth_state.json` | **🔐 AES-256-GCM 암호화 (`cm_aead_v1:`)** | **12시간 TTL (GCS Lifecycle 1일)** |
 | **스캔된 소스코드 & 맥락** (`cm_workspace`) | `/tmp/codemender_sessions/session_<session_id>.json` | `codemender-config/sessions/<session_id>/session_snapshot.json` | 토큰 제거된 세션 JSON | **12시간 TTL (GCS Lifecycle 1일)** |
-| **패치 완료 다운로드 파일** (`patched_*`) | `/tmp/codemender_workspaces/<session_id>/` | `codemender-patches/<session_id>/` | 패치 아티팩트 | **GCS Lifecycle 7일 후 자동 삭제** |
-| **온디맨드 비용 정산 원장** (`ledger`) | `/tmp/codemender_cost_ledger.json` | `codemender-ledger/cost_ledger.json` | 비용/토큰 집계 메타데이터 | **♾️ 영구 보존 (비용 감사 추적용)** |
+| **패치 완료 다운로드 파일** (`patched_*`) | `/tmp/cm-ge-workspaces/<workspace_id>/patched/` | `codemender-patches/<workspace_id>/` | 패치 아티팩트 (`Content-Disposition: attachment`) | **12시간 TTL (GCS Lifecycle 7일)** |
+| **온디맨드 비용 정산 원장** (`ledger`) | `/tmp/cm-ge-workspaces/codemender_cost_ledger.json` | — (GCS 미저장) · Cloud Logging `CODEMENDER_COST_TELEMETRY` | 비용/토큰 집계 메타데이터 (토큰·코드 미포함) | **Cloud Logging 로그 버킷 보존 정책 적용** |
 
 
 ---
@@ -262,7 +262,7 @@ sequenceDiagram
 ### 2.5 Billing 권한 불필요(Billing-Free) Cloud Logging 기반 온디맨드 비용 정산
 
 기업 환경에서 일반 개발자나 보안 담당자는 GCP Billing Account 조회 권한(`roles/billing.viewer`)이 없는 경우가 대부분입니다.  
-본 에이전트는 **Cloud Billing API 권한 없이도 100% 정확한 비용 추적이 가능하도록 Cloud Logging 이중 파이프라인과 GCS 영구 원장**([`app/harness/cost_tracker.py`](app/harness/cost_tracker.py))을 결합했습니다.
+본 에이전트는 **Cloud Billing API 권한 없이도 정확한 비용 추적이 가능하도록 Cloud Logging 구조화 로그(`CODEMENDER_COST_TELEMETRY`)와 세션·컨테이너 로컬 원장**([`app/harness/cost_tracker.py`](app/harness/cost_tracker.py))을 결합했습니다.
 
 - **평소 작업 시 노이즈 제로(Zero-Noise)**: 진단, 패치, GitHub PR 생성 등 일반 업무 대화에서는 비용 표를 출력하지 않고 백그라운드에서 구조화 로그(`CODEMENDER_COST_TELEMETRY`)와 원장에만 조용히 기록합니다.
 - **온디맨드(On-Demand) 정산 명세서**: 사용자가 `오늘 비용 산출해줘`, `비용 조회`, `얼마 나왔어?`, `cm cost`라고 요청할 때만 즉시 호출되어 KST(한국 표준시) 기준 일자별·세션별·트랜잭션별 USD 및 KRW 비용을 정산합니다.
@@ -339,16 +339,17 @@ CODEMENDER_MODEL="gemini-3.8-flash"
 CODEMENDER_FALLBACK_MODEL="gemini-3.7-flash"
 CM_USD_TO_KRW_RATE="1380.0"
 
-# [선택] 5. 패치 파일 다운로드, 세션 격리 스냅샷 및 비용 원장용 GCS 버킷
+# [선택] 5. 패치 파일 다운로드 및 세션 격리 스냅샷(암호화 토큰)용 GCS 버킷 — Lifecycle 자동 적용 (sessions 1일 / patches 7일)
 # - 비워두면("") 자동으로 "${GOOGLE_CLOUD_PROJECT}-a2a-bucket" 이름으로 버킷을 생성합니다.
 CM_GCS_ARTIFACT_BUCKET=""
 
 # [선택] 6. GitHub 연동 및 세션 보안 (AES-256-GCM 암호화 & TTL 만료) 설정
 # - 비워두면("") 채팅창에서 `깃허브 연동` 입력 시 표준 GitHub Device Flow(8자리 코드 인증)가 작동하며,
 #   발급된 토큰은 각 사용자의 대화 세션(session_id)별로 AES-256-GCM 암호화(`cm_aead_v1:`)되어 격리 저장됩니다.
+# - 암호화 마스터 키는 배포 스크립트가 Secret Manager(`codemender-token-encryption-key`)에 무작위 256bit로 자동 생성해
+#   Cloud Run에 CM_TOKEN_ENCRYPTION_KEY(Secret 환경 변수)로 주입하므로 .env에 직접 입력하지 않습니다.
 GITHUB_OAUTH_CLIENT_ID=""
 GITHUB_TOKEN=""
-CM_TOKEN_ENCRYPTION_KEY=""
 CM_GITHUB_TOKEN_TTL_SECONDS="43200"
 CM_SESSION_TTL_SECONDS="43200"
 ```
@@ -366,10 +367,10 @@ CM_SESSION_TTL_SECONDS="43200"
 | `AGENT_DISPLAY_NAME` | 선택 | `CodeMender Security Agent (Gemini 3.8 Flash)` | Gemini Enterprise 에이전트 목록에 표시될 이름 |
 | `CODEMENDER_MODEL` | 선택 | `gemini-3.8-flash` | 기본 보안 추론 및 검증 모델 |
 | `CODEMENDER_FALLBACK_MODEL` | 선택 | `gemini-3.7-flash` | 기본 모델 호출 실패 시 자동 전환될 폴백 모델 |
-| `CM_GCS_ARTIFACT_BUCKET` | 선택 | `<PROJECT_ID>-a2a-bucket` | 세션별 격리 스냅샷, 수정 파일 원클릭 다운로드, 비용 원장 저장용 GCS 버킷 |
+| `CM_GCS_ARTIFACT_BUCKET` | 선택 | `<PROJECT_ID>-a2a-bucket` | 세션별 격리 스냅샷(암호화 토큰 포함) 및 수정 파일 원클릭 다운로드용 GCS 버킷 (Lifecycle 자동 적용) |
 | `GITHUB_OAUTH_CLIENT_ID` | 선택 | 표준 GitHub Device Flow | 커스텀 GitHub OAuth App Client ID (선택) |
 | `GITHUB_TOKEN` | 선택 | 없음 | 단일 고정 GitHub PAT을 사용할 경우에만 입력 (비워두면 유저별 OAuth Device Flow 작동) |
-| `CM_TOKEN_ENCRYPTION_KEY` | 선택 | 프로젝트+세션 고유 유도키 | GitHub OAuth 토큰 AES-256-GCM 암호화용 마스터 시드 키 |
+| `CM_TOKEN_ENCRYPTION_KEY` | 자동 | **Secret Manager 자동 생성** (`codemender-token-encryption-key`) | GitHub OAuth 토큰 AES-256-GCM 암호화용 마스터 키. 배포 스크립트가 무작위 256bit로 생성해 Cloud Run Secret 환경 변수로 주입 (`.env`에 입력하지 않음) |
 | `CM_GITHUB_TOKEN_TTL_SECONDS` | 선택 | `43200` (12시간) | 세션별 GitHub OAuth 토큰 자동 만료 및 물리 삭제 주기(초) |
 | `CM_SESSION_TTL_SECONDS` | 선택 | `43200` (12시간) | 세션 워크스페이스 스냅샷 자동 만료 및 물리 삭제 주기(초) |
 
@@ -386,12 +387,14 @@ CM_SESSION_TTL_SECONDS="43200"
 #### 🔍 스크립트가 자동으로 수행하는 5단계 프로비저닝 과정:
 1. **`[1/5]` Preparing GCP Project & Provisioning Resources**
    - 프로젝트 번호(`PROJECT_NUMBER`) 조회 및 `GE_ENGINE_ID` 자동 탐색
-   - 필수 API 8종(`run`, `cloudbuild`, `artifactregistry`, `aiplatform`, `discoveryengine`, `logging`, `monitoring`, `storage`) 자동 활성화
+   - 필수 API 9종(`run`, `cloudbuild`, `artifactregistry`, `aiplatform`, `discoveryengine`, `logging`, `monitoring`, `storage`, `secretmanager`) 자동 활성화
    - GCS 버킷(`gs://<PROJECT_ID>-a2a-bucket`) 존재 여부 확인 및 미존재 시 자동 생성
-   - **GCS 버킷 수명 주기(Lifecycle) 자동 청소 정책 설정** (`codemender-config/sessions/` 1일 후 자동 삭제, `codemender-patches/` 7일 후 자동 삭제, `codemender-ledger/` 영구 보존)
+   - **GCS 버킷 수명 주기(Lifecycle) 자동 청소 정책 설정** (`codemender-config/sessions/` 1일 후 자동 삭제, `codemender-patches/` 7일 후 자동 삭제)
+   - **토큰 암호화 마스터 키 자동 생성**: Secret Manager `codemender-token-encryption-key`가 없으면 무작위 256bit 키로 생성 (디스크에 기록하지 않음)
    - Cloud Logging 비용 메트릭(`codemender_cost_events`) 존재 여부 확인 및 자동 생성
 2. **`[2/5]` Deploying CodeMender Agent to Cloud Run**
    - 소스코드 컨테이너 빌드 및 Cloud Run Gen2 배포 (`.env` 환경 변수 자동 주입)
+   - Cloud Run 런타임 서비스 계정에 `roles/secretmanager.secretAccessor` 부여 후 `CM_TOKEN_ENCRYPTION_KEY`를 Secret 환경 변수(`codemender-token-encryption-key:latest`)로 바인딩 (이미 바인딩되어 있으면 생략)
 3. **`[3/5]` Configuring IAM Permissions**
    - Discovery Engine 서비스 계정(`service-<PROJECT_NUMBER>@gcp-sa-discoveryengine.iam.gserviceaccount.com`)에 Cloud Run 호출 권한(`roles/run.invoker`) 자동 부여
 4. **`[4/5]` Registering CodeMender A2A + A2UI v0.9 Agent in Gemini Enterprise**
@@ -443,7 +446,7 @@ Gemini Enterprise 웹 콘솔 좌측 메뉴의 **Agents** 탭에서 `CodeMender S
 3. `수정한 파일 다운로드` 또는 `cm artifacts` 입력 →
    - **① 브라우저 원클릭 개별 파일 다운로드 링크**
    - **② 전체 패치 파일 `.zip` 패키지 원클릭 다운로드 링크**
-   - **③ GCS 영구 경로**(`gs://...`) **및 수정된 전체 소스코드 전문** 확인
+   - **③ GCS 경로**(`gs://...`, 7일간 보관 후 자동 정리) **및 수정된 전체 소스코드 전문** 확인
 
 ### 시나리오 4: 온디맨드(On-Demand) 실시간 비용 및 토큰 정산 조회 (`cm cost`)
 - 채팅창에 `오늘 비용 산출해줘`, `비용 조회`, `얼마 나왔어?`, 또는 `cm cost` 입력
@@ -471,7 +474,7 @@ Gemini Enterprise 웹 콘솔 좌측 메뉴의 **Agents** 탭에서 `CodeMender S
 | **7** | **형상 관리 (VCS)** | `cm vcs status \| diff \| stage \| reset` / `버전 관리` | 수정 파일 해시 확인, Git Unified Diff, 커밋 메시지 생성, 워크스페이스 초기화 |
 | **8** | **빌드 & 회귀 검증** | `cm build [--force]` / `빌드 검증` | 패치 후 Python AST / C(`clang`/`gcc`) / JS(`node --check`) 구문 및 회귀 검증 |
 | **9** | **멀티모델 관리** | `cm models` / `모델 관리` / `cm switch-model <m>` | 지원 모델 제원·단가 비교 및 세션 활성 모델 즉시 전환 |
-| **10** | **온디맨드 비용 정산** | `cm cost` / `오늘 비용 산출해줘` / `비용 조회` | Cloud Logging + 영구 원장 기반 일자별·세션별 토큰 및 비용(USD/KRW) 정산 |
+| **10** | **온디맨드 비용 정산** | `cm cost` / `오늘 비용 산출해줘` / `비용 조회` | Cloud Logging 구조화 로그 + 세션·로컬 원장 기반 일자별·세션별 토큰 및 비용(USD/KRW) 정산 |
 | **11** | **세션 타임라인** | `cm sessions` / `세션 이력` | 현재 세션의 명령어 실행 이력 및 단계별 소요 시간/비용 타임라인 |
 | **12** | **아티팩트 다운로드** | `cm artifacts` / `cm download` / `다운로드` | 패치된 파일 및 `.zip` 번들의 GCS 원클릭 다운로드 링크 및 전체 소스 출력 |
 | **13** | **GitHub 연동 & PR** | `깃허브 연동` / `내 래포목록 프라이빗만` / `<URL> 스캔해줘` / `pr만들어봐` | 세션 격리 GitHub OAuth 인증, 공개/비공개 저장소 필터 조회, 폴더 제외 원격 코드 스캔, 자율 보안 PR 생성 |
@@ -513,12 +516,12 @@ codemender-ge/
 │   │   ├── cm_runner.py             # 3-Stage (find -> verify -> fix) 파이프라인 실행 엔진
 │   │   ├── patch_applier.py         # AST 구문 무결성 검증(ast.parse) + 상대 들여쓰기 보존 퍼지 패치 엔진
 │   │   ├── github_integration.py    # 세션 바인딩 AES-256-GCM 토큰 암호화, 폴더 제외 스캔, 자율 PR 생성기
-│   │   └── cost_tracker.py          # Cloud Logging + GCS 영구 비용 원장 온디맨드 정산기
+│   │   └── cost_tracker.py          # Cloud Logging 구조화 로그 + 로컬 원장 기반 온디맨드 비용 정산기
 │   └── ingestion/
 │       └── file_manager.py          # 격리 워크스페이스 관리, ZIP/파일 인제스천, GCS 퍼블리셔
 └── tests/
-    ├── unit/                        # 단위 테스트 스위트 (17개 핵심 보안/세션격리/AES암호화/멀티턴맥락/AST패치 검증 케이스)
-    └── integration/                 # 통합 테스트 스위트 (3개 에이전트/서버 E2E 검증 케이스)
+    ├── unit/                        # 단위 테스트 스위트 (16개: 업로드 보안·ZIP Slip/XXE 차단·세션격리·AES암호화·멀티턴맥락·AST패치 검증)
+    └── integration/                 # 통합 테스트 스위트 (4개: 에이전트 스트림·/run_sse·A2A 스트림·Agent Card 검증)
 ```
 
 ---

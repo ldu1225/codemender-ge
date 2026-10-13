@@ -375,9 +375,10 @@ if [[ "${REGISTER_ONLY}" == "false" ]]; then
     logging.googleapis.com \
     monitoring.googleapis.com \
     storage.googleapis.com \
+    secretmanager.googleapis.com \
     --project "${PROJECT_ID}" >/dev/null
 
-  echo "  -> Ensuring GCS Artifact & Ledger Bucket (gs://${CM_GCS_ARTIFACT_BUCKET}) exists..."
+  echo "  -> Ensuring GCS Artifact & Session Bucket (gs://${CM_GCS_ARTIFACT_BUCKET}) exists..."
   if ! gcloud storage buckets describe "gs://${CM_GCS_ARTIFACT_BUCKET}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
     gcloud storage buckets create "gs://${CM_GCS_ARTIFACT_BUCKET}" \
       --project "${PROJECT_ID}" \
@@ -388,7 +389,7 @@ if [[ "${REGISTER_ONLY}" == "false" ]]; then
     echo "  ✓ Bucket gs://${CM_GCS_ARTIFACT_BUCKET} already exists"
   fi
 
-  echo "  -> Applying GCS Bucket Lifecycle auto-expiration policy (sessions: 1d TTL, patches: 7d TTL, ledger: permanent)..."
+  echo "  -> Applying GCS Bucket Lifecycle auto-expiration policy (sessions: 1d, patches: 7d)..."
   LIFECYCLE_TMP="$(mktemp /tmp/codemender_gcs_lifecycle.XXXXXX.json)"
   cat > "${LIFECYCLE_TMP}" <<'EOF'
 {
@@ -417,7 +418,23 @@ EOF
     --lifecycle-file="${LIFECYCLE_TMP}" >/dev/null 2>&1 || true
   rm -f "${LIFECYCLE_TMP}"
   gcloud storage rm "gs://${CM_GCS_ARTIFACT_BUCKET}/codemender-config/github_auth_state.json" >/dev/null 2>&1 || true
-  echo "  ✓ Configured GCS Lifecycle rules (sessions: 1d auto-delete, patches: 7d auto-delete, cost ledger: retained)"
+  echo "  ✓ Configured GCS Lifecycle rules (codemender-config/sessions/: 1d auto-delete, codemender-patches/: 7d auto-delete)"
+
+  TOKEN_KEY_SECRET="${CM_TOKEN_KEY_SECRET_NAME:-codemender-token-encryption-key}"
+  echo "  -> Ensuring AES-256-GCM token encryption key in Secret Manager (${TOKEN_KEY_SECRET})..."
+  if ! gcloud secrets describe "${TOKEN_KEY_SECRET}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+    if python3 -c 'import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(), end="")' \
+      | gcloud secrets create "${TOKEN_KEY_SECRET}" \
+          --project "${PROJECT_ID}" \
+          --replication-policy=automatic \
+          --data-file=- >/dev/null 2>&1; then
+      echo "  ✓ Created Secret Manager secret ${TOKEN_KEY_SECRET} (random 256-bit key, never written to disk)"
+    else
+      echo "  ⚠️ Could not create Secret Manager secret ${TOKEN_KEY_SECRET} (check secretmanager.admin permission)"
+    fi
+  else
+    echo "  ✓ Secret Manager secret ${TOKEN_KEY_SECRET} already exists"
+  fi
 
 
   echo "  -> Ensuring Cloud Logging Cost Telemetry Metric (codemender_cost_events) exists..."
@@ -454,6 +471,52 @@ EOF
       --max-instances 10 \
       --no-allow-unauthenticated \
       --set-env-vars "${ENV_VARS}"
+  fi
+
+  echo "  -> Binding ${TOKEN_KEY_SECRET} to Cloud Run as CM_TOKEN_ENCRYPTION_KEY (Secret Manager env var)..."
+  RUN_SA="$(gcloud run services describe "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" --format='value(spec.template.spec.serviceAccountName)' 2>/dev/null || true)"
+  RUN_SA="${RUN_SA:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
+  gcloud secrets add-iam-policy-binding "${TOKEN_KEY_SECRET}" \
+    --project "${PROJECT_ID}" \
+    --member "serviceAccount:${RUN_SA}" \
+    --role roles/secretmanager.secretAccessor >/dev/null 2>&1 || true
+  SECRET_BOUND="$( { gcloud run services describe "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" --format=json 2>/dev/null || true; } \
+    | TOKEN_KEY_SECRET="${TOKEN_KEY_SECRET}" python3 -c '
+import json, os, sys
+try:
+    svc = json.load(sys.stdin)
+    envs = svc["spec"]["template"]["spec"]["containers"][0].get("env", [])
+    ok = any(
+        e.get("name") == "CM_TOKEN_ENCRYPTION_KEY"
+        and e.get("valueFrom", {}).get("secretKeyRef", {}).get("name") == os.environ["TOKEN_KEY_SECRET"]
+        for e in envs
+    )
+    print("yes" if ok else "no")
+except Exception:
+    print("no")
+')"
+  if [[ "${SECRET_BOUND}" == "yes" ]]; then
+    echo "  ✓ CM_TOKEN_ENCRYPTION_KEY already bound to ${TOKEN_KEY_SECRET}:latest (runtime SA: ${RUN_SA})"
+  else
+    BIND_OK=false
+    for attempt in 1 2 3; do
+      if gcloud run services update "${SERVICE_NAME}" \
+          --project "${PROJECT_ID}" \
+          --region "${REGION}" \
+          --update-secrets "CM_TOKEN_ENCRYPTION_KEY=${TOKEN_KEY_SECRET}:latest" \
+          --quiet >/dev/null 2>&1; then
+        BIND_OK=true
+        break
+      fi
+      echo "  … waiting for Secret Manager IAM propagation (attempt ${attempt}/3)"
+      sleep 20
+    done
+    if [[ "${BIND_OK}" == "true" ]]; then
+      echo "  ✓ Bound CM_TOKEN_ENCRYPTION_KEY to Secret Manager ${TOKEN_KEY_SECRET}:latest (runtime SA: ${RUN_SA})"
+    else
+      echo "  ⚠️ Could not bind ${TOKEN_KEY_SECRET}. Tokens fall back to the derived default key; bind manually with:"
+      echo "     gcloud run services update ${SERVICE_NAME} --region ${REGION} --update-secrets CM_TOKEN_ENCRYPTION_KEY=${TOKEN_KEY_SECRET}:latest"
+    fi
   fi
 else
   echo "=================================================================="

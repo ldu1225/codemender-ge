@@ -45,6 +45,7 @@ from app.config import (
     GCS_ARTIFACT_BUCKET,
     GE_ENGINE_ID,
     GE_LOCATION,
+    WORKSPACE_ROOT,
 )
 from app.harness import (
     CodeMenderRunner,
@@ -122,12 +123,21 @@ def _cleanup_expired_local_sessions() -> None:
         except OSError:
             pass
 
-    ws_root = Path("/tmp/codemender_workspaces")
+    ws_root = Path(WORKSPACE_ROOT)
     if ws_root.exists():
         try:
             for d in ws_root.iterdir():
                 try:
-                    if d.is_dir() and (now_ts - d.stat().st_mtime) > _SESSION_TTL_SECONDS:
+                    if not d.is_dir():
+                        continue
+                    # Measure the most recent activity anywhere in the workspace tree (not only the root dir mtime)
+                    latest_mtime = d.stat().st_mtime
+                    for p in d.rglob("*"):
+                        try:
+                            latest_mtime = max(latest_mtime, p.stat().st_mtime)
+                        except OSError:
+                            continue
+                    if (now_ts - latest_mtime) > _SESSION_TTL_SECONDS:
                         shutil.rmtree(d, ignore_errors=True)
                 except OSError:
                     pass
@@ -436,7 +446,7 @@ def _format_scan_report_markdown(
             dl_url = item.get("download_url") or ""
             con_url = item.get("console_url") or ""
             gcs_uri = item.get("gcs_uri") or f"gs://{GCS_ARTIFACT_BUCKET}/codemender-patches/{pipeline_result.workspace_id}/{patched_fname}"
-            loc_path = item.get("local_container_path") or f"/tmp/codemender_workspaces/{pipeline_result.workspace_id}/patched/{fpath}"
+            loc_path = item.get("local_container_path") or f"{WORKSPACE_ROOT}/{pipeline_result.workspace_id}/patched/{fpath}"
             if item.get("zip_download_url"):
                 zip_dl_url = str(item["zip_download_url"])
             if item.get("zip_gcs_uri"):
@@ -452,7 +462,7 @@ def _format_scan_report_markdown(
             )
         if zip_dl_url:
             lines.append(
-                f"| **📦 전체 수정본 ZIP 번들** | 전체 파일 패키지 | **[📦 `codemender_patched.zip` 다운로드]({zip_dl_url})** | `{zip_gcs_uri}` | `/tmp/codemender_workspaces/{pipeline_result.workspace_id}/patched/` |"
+                f"| **📦 전체 수정본 ZIP 번들** | 전체 파일 패키지 | **[📦 `codemender_patched.zip` 다운로드]({zip_dl_url})** | `{zip_gcs_uri}` | `{WORKSPACE_ROOT}/{pipeline_result.workspace_id}/patched/` |"
             )
         lines.append("")
 
@@ -1428,7 +1438,7 @@ def _generate_contextual_chat_response(
             "1. 사용자가 일상적인 질문(예: '오늘 날씨는?', '점심 추천해줘', '고마워', '너는 누구야?')을 하면, "
             "절대 보안 스캔 리포트를 쏟아내지 말고 질문 맥락에 맞춰 먼저 자연스럽게 대답하세요.\n"
             "2. 사용자가 `sample_payment_service.py`가 어디에 있는 파일인지, 왜 이 파일이 나왔는지, 혹은 '뭔데 이게'라고 물어보면: "
-            "`sample_payment_service.py`는 사용자의 GitHub 레포지토리 파일이 아니라 CodeMender 컨테이너 격리 워크스페이스(`/tmp/codemender_workspaces/.../orig/sample_payment_service.py`)에 내장된 기본 데모용 샘플 파일임을 명확히 설명하세요. "
+            f"`sample_payment_service.py`는 사용자의 GitHub 레포지토리 파일이 아니라 CodeMender 컨테이너 격리 워크스페이스(`{WORKSPACE_ROOT}/<workspace_id>/orig/sample_payment_service.py`)에 내장된 기본 데모용 샘플 파일임을 명확히 설명하세요. "
             "그리고 현재 지목된 타겟 레포지토리(예: `ldu1225/codemender-ge`)를 스캔하려면 `깃허브 스캔 ldu1225/codemender-ge` 또는 `sample 폴더 외에 다 스캔해`라고 입력하면 즉시 해당 GitHub 레포의 실제 코드를 가져와 스캔한다고 안내하세요.\n"
             "3. 사용자가 특정 레포지토리 이름(예: 'codemender-ge레포')만 언급했다면, 해당 레포지토리(`"
             f"{target_repo_full or '지정된 레포'}`"

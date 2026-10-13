@@ -51,8 +51,10 @@ from app.config import (
     CLOUD_RUN_VCPU_PER_SEC_USD,
     CM_USD_TO_KRW_RATE,
     CODEMENDER_MODEL,
+    COST_LEDGER_FILENAME,
     GCP_PROJECT_ID,
     GCS_ARTIFACT_BUCKET,
+    WORKSPACE_ROOT,
 )
 from app.harness.cm_runner import (
     CodeMenderPipelineResult,
@@ -2089,11 +2091,11 @@ async def execute_cm_command(
         lines = [
             f"### 📦 `cm artifacts` / `cm download` — 수정된 파일 실제 저장 위치 및 원클릭 다운로드 (`{workspace.workspace_id}`)",
             "> 💡 **왜 이전에는 다운로드가 안 되었나요?**  ",
-            "> Cloud Run 컨테이너 내부 임시 격리 디스크(`/tmp/codemender_workspaces/...`)와 ADK 인메모리 아티팩트 스토어에만 저장되어 있으면 Gemini Enterprise 웹 UI에서 직접 클릭해 내려받을 수 없습니다.  ",
-            f"> 이제 모든 패치 작업본과 ZIP 패키지를 **Google Cloud Storage 영구 버킷**(`gs://{GCS_ARTIFACT_BUCKET}/codemender-patches/...`)에 자동 동기화하여 **브라우저 원클릭 다운로드 링크**와 **전체 수정본 코드 전문**을 함께 제공합니다!",
+            f"> Cloud Run 컨테이너 내부 임시 격리 디스크(`{WORKSPACE_ROOT}/...`)와 ADK 인메모리 아티팩트 스토어에만 저장되어 있으면 Gemini Enterprise 웹 UI에서 직접 클릭해 내려받을 수 없습니다.  ",
+            f"> 이제 모든 패치 작업본과 ZIP 패키지를 **Google Cloud Storage 버킷**(`gs://{GCS_ARTIFACT_BUCKET}/codemender-patches/...`, 7일 후 Lifecycle 자동 정리)에 자동 동기화하여 **브라우저 원클릭 다운로드 링크**와 **전체 수정본 코드 전문**을 함께 제공합니다!",
             "",
             "#### 1️⃣ 📥 원클릭 브라우저 직접 다운로드 & 3중 저장소 경로",
-            "| 구분 | 파일명 | 1️⃣ 원클릭 직접 다운로드 (클릭) | 2️⃣ Google Cloud Storage 영구 경로 (`gs://`) | 3️⃣ Cloud Run 컨테이너 경로 |",
+            "| 구분 | 파일명 | 1️⃣ 원클릭 직접 다운로드 (클릭) | 2️⃣ Google Cloud Storage 경로 (`gs://`, 7일 보관) | 3️⃣ Cloud Run 컨테이너 경로 |",
             "| :--- | :--- | :--- | :--- | :--- |",
         ]
         for pf in pub_files:
@@ -2123,7 +2125,7 @@ async def execute_cm_command(
             "| **보안 리포트 (`json`/`html`)** | `codemender-report.json`, `codemender-report.html` | `cm report -f json` / `html` 실행 시 생성 | - | `ADK Artifact Store` |"
         )
         lines.append(
-            "| **비용 추적 원장 (`ledger`)** | `codemender_cost_ledger.json` | 모든 CodeMender 실행 토큰 및 USD/KRW 비용 영구 누적 원장 | `Cloud Logging (run.googleapis.com/stdout)` | `/tmp/codemender_cost_ledger.json` |"
+            f"| **비용 추적 원장 (`ledger`)** | `{COST_LEDGER_FILENAME}` | CodeMender 실행 토큰 및 USD/KRW 비용 누적 원장 (영구 추적은 Cloud Logging `CODEMENDER_COST_TELEMETRY`) | `Cloud Logging (run.googleapis.com/stdout)` | `{WORKSPACE_ROOT}/{COST_LEDGER_FILENAME}` |"
         )
         lines.append("")
 
