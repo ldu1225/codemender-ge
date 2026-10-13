@@ -803,10 +803,8 @@ def _classify_user_intent(
 
     if not active_target_repo and chat_history:
         for turn in reversed(chat_history[-6:]):
-            r_cand = extract_target_repo_from_text(str(turn.get("user") or "")) or extract_target_repo_from_text(
-                str(turn.get("assistant") or "")
-            )
-            if r_cand:
+            r_cand = extract_target_repo_from_text(str(turn.get("user") or ""))
+            if r_cand and r_cand.lower() not in ("owner/repo", "<owner>/<repo>", "소유자/저장소명"):
                 active_target_repo = r_cand
                 state["cm_target_repo"] = r_cand
                 break
@@ -839,7 +837,31 @@ def _classify_user_intent(
     ):
         return {"intent": "chat_or_question", "target_repo": active_target_repo}
 
-    # 2. If user only mentioned a repository name without any scan/PR action verb (e.g. "codemender-ge레포")
+    # 2. Explicit built-in demo / sample scan request (ONLY when NOT excluding a sample folder and NOT asking about sample_payment_service.py)
+    if (
+        not exclude_paths
+        and not mentioned_repo
+        and "sample_payment_service" not in low
+        and any(
+            kw in low or kw.replace(" ", "") in no_space
+            for kw in (
+                "샘플 진단",
+                "샘플 스캔",
+                "샘플 실행",
+                "샘플 테스트",
+                "샘플 코드",
+                "데모 실행",
+                "데모 스캔",
+                "데모 진단",
+                "run sample",
+                "sample scan",
+                "demo scan",
+            )
+        )
+    ) or low in ("샘플", "데모", "sample", "demo", "테스트 실행", "진단 실행"):
+        return {"intent": "run_sample_scan"}
+
+    # 3. If user only mentioned a repository name without any scan/PR action verb (e.g. "codemender-ge레포")
     has_scan_verb = any(
         v in low or v.replace(" ", "") in no_space
         for v in (
@@ -871,7 +893,7 @@ def _classify_user_intent(
     if mentioned_repo and not has_scan_verb and "pr" not in low and not exclude_paths:
         return {"intent": "chat_or_question", "target_repo": active_target_repo}
 
-    # 3. Folder exclusion scan or active target repo scan ("sample폴더외에 다 스캔해", "다 스캔해", "응 스캔해줘")
+    # 4. Folder exclusion scan or active target repo scan ("sample폴더외에 다 스캔해", "다 스캔해", "응 스캔해줘")
     if (exclude_paths and has_scan_verb) or (
         active_target_repo and (has_scan_verb or has_affirmative_scan_followup)
     ):
@@ -882,29 +904,6 @@ def _classify_user_intent(
             "subpath": "",
         }
 
-    # 4. Explicit built-in demo / sample scan request (ONLY when NOT excluding a sample folder and NOT asking about sample_payment_service.py)
-    if (
-        not exclude_paths
-        and "sample_payment_service" not in low
-        and not active_target_repo
-        and any(
-            kw in low or kw.replace(" ", "") in no_space
-            for kw in (
-                "샘플 진단",
-                "샘플 스캔",
-                "샘플 실행",
-                "샘플 테스트",
-                "샘플 코드",
-                "데모 실행",
-                "데모 스캔",
-                "데모 진단",
-                "run sample",
-                "sample scan",
-                "demo scan",
-            )
-        )
-    ) or low in ("샘플", "데모", "sample", "demo", "테스트 실행", "진단 실행"):
-        return {"intent": "run_sample_scan"}
 
     # 5. Patch application on existing scan findings
     if state.get("cm_pipeline_result") and any(

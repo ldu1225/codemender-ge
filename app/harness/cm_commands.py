@@ -242,7 +242,17 @@ _NON_REPO_SLASH_TOKENS = {
     "github.com",
     "v1",
     "v2",
+    "owner",
+    "repo",
+    "usd",
+    "krw",
+    "ci",
+    "cd",
+    "text",
+    "json",
+    "html",
 }
+
 
 _NON_REPO_NAME_TOKENS = {
     "github",
