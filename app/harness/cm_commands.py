@@ -226,16 +226,42 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
     first_line = stripped.splitlines()[0].strip()
     lower = first_line.lower()
 
-    # 1. Explicit `cm ...` CLI syntax in chat
+    # 1. Explicit `cm ...` CLI syntax in chat (tolerating Korean verb suffixes like `cm session쳐봐.\`)
     if lower == "cm" or lower.startswith("cm "):
+        cleaned_line = re.sub(r"[\\]+$", "", first_line).strip()
         try:
-            tokens = shlex.split(first_line)
+            tokens = shlex.split(cleaned_line)
         except ValueError:
-            tokens = first_line.split()
+            tokens = cleaned_line.split()
         if len(tokens) == 1:
             return {"subcommand": "help", "raw": first_line}
 
-        sub = tokens[1].lower()
+        raw_sub = tokens[1].lower()
+        sub_match = re.match(r"^([a-z0-9_-]+)", raw_sub)
+        sub = sub_match.group(1) if sub_match else raw_sub
+        sub_aliases = {
+            "session": "sessions",
+            "sessions": "sessions",
+            "history": "sessions",
+            "model": "models",
+            "models": "models",
+            "artifact": "artifacts",
+            "artifacts": "artifacts",
+            "download": "artifacts",
+            "downloads": "artifacts",
+            "stat": "cost",
+            "stats": "cost",
+            "cost": "cost",
+            "costs": "cost",
+            "billing": "cost",
+            "log": "cost",
+            "logs": "cost",
+            "gh": "github",
+            "github": "github",
+            "report": "report",
+            "reports": "report",
+        }
+        sub = sub_aliases.get(sub, sub)
         rest = tokens[2:]
 
         # Extract common flags
@@ -271,6 +297,10 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
             elif tok.startswith("-"):
                 i += 1
             else:
+                # Ignore trailing Korean polite endings like "쳐봐", "해봐", "해줘", "실행"
+                if re.match(r"^[가-힣.!?\s\\]+$", tok):
+                    i += 1
+                    continue
                 positional.append(tok)
                 i += 1
 
@@ -299,14 +329,22 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
                 return True
         return False
 
-    if _matches("cm 명령어", "명령어 목록", "전체 기능", "무슨 기능", "기능 목록"):
+    if _matches("cm 명령어", "명령어 목록", "전체 기능", "무슨 기능", "기능 목록", "명령어 가이드"):
         return {"subcommand": "help", "raw": first_line}
 
-    if _matches("워크스페이스 초기화", "cm 초기화", "설정 초기화"):
+    if _matches("워크스페이스 초기화", "cm 초기화", "설정 초기화", "샌드박스 초기화"):
         return {"subcommand": "init", "verify": True, "raw": first_line}
 
     if _matches("트리아지", "triage", "우선순위 분류", "보안 게이트", "security gate"):
         return {"subcommand": "triage", "raw": first_line}
+
+    if _matches("샌드박스 검증", "검증 실행", "오탐 검증", "poc 검증"):
+        vid_match = re.search(r"(CM-[A-Z0-9-]+-\d+)", first_line, re.IGNORECASE)
+        return {
+            "subcommand": "verify",
+            "positional": [vid_match.group(1).upper()] if vid_match else ["ALL"],
+            "raw": first_line,
+        }
 
     if _matches("패치 롤백", "패치 취소", "패치 원복", "원복해", "롤백해", "revert"):
         vid_match = re.search(r"(CM-[A-Z0-9-]+-\d+)", first_line, re.IGNORECASE)
@@ -317,19 +355,19 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
             "raw": first_line,
         }
 
-    if _matches("json 리포트", "json 보고서", "report json"):
+    if _matches("json 리포트", "json 보고서", "report json", "sarif"):
         return {"subcommand": "report", "format": "json", "raw": first_line}
 
     if _matches("html 리포트", "html 보고서", "report html"):
         return {"subcommand": "report", "format": "html", "raw": first_line}
 
-    if _matches("리포트 조회", "보고서 출력", "결과 요약표"):
+    if _matches("리포트 조회", "리포트 내보내기", "보고서 출력", "결과 요약표"):
         return {"subcommand": "report", "format": "text", "raw": first_line}
 
     if _matches("vcs diff", "git diff", "변경사항 비교", "전체 diff"):
         return {"subcommand": "vcs", "positional": ["diff"], "raw": first_line}
 
-    if _matches("vcs status", "git status", "파일 상태", "수정 상태"):
+    if _matches("vcs status", "git status", "파일 상태", "수정 상태", "버전 관리", "형상 관리", "vcs 상태"):
         return {"subcommand": "vcs", "positional": ["status"], "raw": first_line}
 
     if _matches("vcs reset", "git reset", "원본으로 초기화"):
@@ -338,7 +376,7 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
     if _matches("vcs stage", "git stage", "커밋 메시지"):
         return {"subcommand": "vcs", "positional": ["stage"], "raw": first_line}
 
-    if _matches("빌드 검증", "컴파일 검증", "구문 검사", "빌드 테스트"):
+    if _matches("빌드 검증", "컴파일 검증", "구문 검사", "구문 검증", "빌드 테스트"):
         return {"subcommand": "build", "raw": first_line}
 
     if _matches(
@@ -361,12 +399,27 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
         "세션마다",
         "로그 비용",
         "로깅 비용",
+        "로깅 추적",
         "클라우드 로깅",
         "cloud logging",
     ) or any(k in lower.split() for k in ("stats", "cost", "billing", "logs")):
         return {"subcommand": "cost", "raw": first_line}
 
-    if _matches("세션 이력", "명령 이력") or "sessions" in lower.split():
+    if (
+        _matches(
+            "세션 이력",
+            "명령 이력",
+            "실행 이력",
+            "세션 기록",
+            "세션 타임라인",
+            "타임라인",
+            "세션 목록",
+            "세션 조회",
+            "cmsession",
+            "cmsessions",
+        )
+        or any(k in lower.split() for k in ("sessions", "session"))
+    ):
         return {"subcommand": "sessions", "raw": first_line}
 
     if _matches(
@@ -384,7 +437,26 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
     ):
         return {"subcommand": "artifacts", "raw": first_line}
 
-    if _matches("모델 비교", "모델 목록", "모델 테스트", "test-all-models", "switch-model"):
+    if _matches(
+        "모델 관리",
+        "멀티 모델",
+        "멀티모델",
+        "모델 비교",
+        "모델 목록",
+        "모델 리스트",
+        "모델 테스트",
+        "모델 변경",
+        "모델 전환",
+        "모델 바꾸",
+        "모델 바꿔",
+        "모델 선택",
+        "지원 모델",
+        "현재 모델",
+        "무슨 모델",
+        "어떤 모델",
+        "test-all-models",
+        "switch-model",
+    ):
         for m_name in SUPPORTED_CM_MODELS:
             if m_name in lower:
                 return {
@@ -393,6 +465,14 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
                     "raw": first_line,
                 }
         return {"subcommand": "models", "raw": first_line}
+
+    for m_name in SUPPORTED_CM_MODELS:
+        if m_name in lower and _matches("바꿔", "전환", "변경", "설정", "사용", "써줘", "switch", "use"):
+            return {
+                "subcommand": "switch-model",
+                "positional": [m_name],
+                "raw": first_line,
+            }
 
     # 3. GitHub OAuth / Repo Scan / Autonomous PR natural-language triggers
     tok_match = re.search(r"\b(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b", stripped)
@@ -751,10 +831,10 @@ def format_cm_help_markdown(active_model: str = CODEMENDER_MODEL) -> str:
         "| **6. 패치 롤백/원복** | `cm fix --revert [<ID\\|ALL>]` | `패치 롤백`, `패치 원복` | 적용된 보안 패치를 취소하고 업로드 당시 원본 코드로 복원 |\n"
         "| **7. 리포트 내보내기** | `cm report [-f text\\|json\\|html]` | `json 리포트`, `html 리포트` | 요약 테이블(`text`), 공식 스키마 `json`, 다크모드 대시보드 `html` 리포트 생성 |\n"
         "| **8. 트리아지 & 게이트** | `cm triage` | `트리아지`, `보안 게이트` | 심각도순(`CRITICAL`→`LOW`) 우선순위 큐 정렬 및 **CI/CD Security Gate** 통과 여부 판정 |\n"
-        "| **9. VCS 버전 관리** | `cm vcs status \\| diff \\| reset \\| stage` | `git diff`, `원본으로 초기화`, `pr 생성` | 수정 파일 해시 확인(`status`), 전체 통합 Diff(`diff`), 전체 초기화(`reset`), 자율 보안 PR 생성(`stage`) |\n"
+        "| **9. VCS 버전 관리** | `cm vcs status \\| diff \\| reset \\| stage` | `버전 관리`, `git diff`, `원본으로 초기화`, `pr 생성` | 수정 파일 해시 확인(`status`), 전체 통합 Diff(`diff`), 전체 초기화(`reset`), 자율 보안 PR 생성(`stage`) |\n"
         "| **10. 빌드/구문 검증** | `cm build [--force]` | `빌드 검증`, `컴파일 검증` | 패치 후 격리 샌드박스에서 언어별 컴파일/구문 검증(`py_compile`, `C syntax`) 실행 |\n"
-        "| **11. 비용 & 로깅 추적** | `cm cost` / `cm logs` / `cm stats` / `cm sessions` / `cm artifacts` | `비용 조회`, `로그 비용`, `클라우드 로깅`, `토큰 사용량` | **Cloud Billing API 없이 Cloud Logging(`entries:list`) + 구조화 JSON 로그 + Cloud Run `httpRequest.latency`로 실시간 추적되는 LLM·컨테이너 비용(USD/KRW)** |\n"
-        "| **12. 멀티 모델 관리** | `cm models` / `cm switch-model <모델명>` | `모델 비교` | `gemini-3.8-flash`, `gemini-3.8-flash-cyber`, `gemini-3.7-flash` 3대 모델 비교·단가 확인 및 전환 |\n"
+        "| **11. 비용 & 로깅 추적** | `cm cost` / `cm logs` / `cm stats` / `cm sessions` / `cm artifacts` | `비용 조회`, `세션 이력`, `다운로드` | **Cloud Billing API 없이 Cloud Logging(`entries:list`) + 구조화 JSON 로그 + Cloud Run `httpRequest.latency`로 실시간 추적되는 LLM·컨테이너 비용(USD/KRW)** |\n"
+        "| **12. 멀티 모델 관리** | `cm models` / `cm switch-model <모델명>` | `모델 관리`, `모델 비교`, `모델 전환` | `gemini-3.8-flash`, `gemini-3.8-flash-cyber`, `gemini-3.7-flash` 3대 모델 비교·단가 확인 및 전환 |\n"
         "| **13. GitHub 계정 연동** | `cm github login \\| status \\| repos \\| scan <owner/repo> \\| pr [owner/repo]` | `깃허브 로그인`, `깃허브 인증 완료`, `내 레포 목록`, `깃허브 스캔`, `깃허브 PR 생성` | **내 GitHub OAuth 기기 인증(`https://github.com/login/device`)으로 Private/Public 레포를 직접 스캔하고 실제 보안 패치 브랜치 푸시 & Pull Request를 자동 생성** |\n"
     )
 
@@ -1707,27 +1787,48 @@ async def execute_cm_command(
         return {"markdown": "\n".join(lines), "pipeline_result": pipeline_res}
 
     # 11. cm sessions & cm artifacts / cm download
-    if sub in ("sessions", "artifacts", "download"):
-        pipeline_res = _ensure_pipeline()
+    if sub in ("sessions", "session", "artifacts", "download"):
         elapsed = int((time.monotonic() - t0) * 1000) + 10
         cost_footer = _record_cm_telemetry(state, parsed_cmd.get("raw", f"cm {sub}"), active_model, elapsed, 130, 210)
         history = list(state.get("cm_command_history") or [])
 
-        if sub == "sessions":
+        if sub in ("sessions", "session"):
+            sess_ledger = state.get("codemender_session_cost_ledger") or {}
+            ledger_runs = list(sess_ledger.get("runs") or []) if isinstance(sess_ledger, dict) else []
+            merged_rows: list[dict[str, Any]] = []
+            for r in ledger_runs:
+                merged_rows.append(
+                    {
+                        "timestamp": r.get("timestamp_utc") or _now_iso(),
+                        "command": "3-Stage Security Scan (cm find -> verify -> fix)",
+                        "model": r.get("model") or active_model,
+                        "duration_ms": int(float(r.get("duration_ms", 0))),
+                        "input_tokens": int(r.get("input_tokens", 0)),
+                        "output_tokens": int(r.get("output_tokens", 0)),
+                        "thinking_tokens": int(r.get("thinking_tokens", 0)),
+                        "cost_usd": float(r.get("total_cost_usd", 0.0)),
+                        "cost_krw": float(r.get("total_cost_krw", 0.0)),
+                    }
+                )
+            for h in history:
+                merged_rows.append(h)
+
             lines = [
                 f"### 🗂️ `cm sessions` — 현재 세션(`{workspace.session_id}`) 명령 실행 타임라인 및 비용",
-                f"- **워크스페이스 ID**: `{workspace.workspace_id}` | **활성 모델**: `{active_model}`",
+                f"- **워크스페이스 ID**: `{workspace.workspace_id}` | **활성 모델**: `{active_model}` | **총 기록 건수**: `{len(merged_rows)}건`",
                 "",
-                "| # | 실행 시각 (UTC) | 실행 명령어 | 모델 | 소요 시간 | 토큰 (In/Out/Think) | 비용 (USD / KRW) |",
+                "| # | 실행 시각 (UTC) | 실행 명령어 / 작업 | 모델 | 소요 시간 | 토큰 (In/Out/Think) | 비용 (USD / KRW) |",
                 "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
             ]
-            for h in history:
+            for idx_row, h in enumerate(merged_rows, start=1):
                 h_usd = float(h.get("cost_usd", 0.0))
                 h_krw = float(h.get("cost_krw", h_usd * CM_USD_TO_KRW_RATE))
                 lines.append(
-                    f"| `{h['index']}` | `{h['timestamp']}` | `{h['command']}` | `{h['model']}` | `{h['duration_ms']} ms` | `{h['input_tokens']}/{h['output_tokens']}/{h.get('thinking_tokens', 0)}` | **{format_usd(h_usd)} ({format_krw(h_krw)})** |"
+                    f"| `{idx_row}` | `{h.get('timestamp', '-')}` | `{h.get('command', '-')}` | `{h.get('model', active_model)}` | `{h.get('duration_ms', 0)} ms` | `{h.get('input_tokens', 0)}/{h.get('output_tokens', 0)}/{h.get('thinking_tokens', 0)}` | **{format_usd(h_usd)} ({format_krw(h_krw)})** |"
                 )
             return {"markdown": "\n".join(lines) + cost_footer}
+
+        pipeline_res = _ensure_pipeline()
 
         # `cm artifacts` / `cm download` / "수정한 파일 어디에 저장되어 있어?" / "다운로드"
         from app.ingestion.file_manager import publish_workspace_patched_files_to_gcs

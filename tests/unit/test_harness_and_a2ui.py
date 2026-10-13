@@ -697,3 +697,59 @@ def test_multi_user_session_isolation_and_snapshot_rehydration(monkeypatch) -> N
     assert "cm_workspace" not in new_instance_state_b
 
 
+def test_conversational_context_and_natural_commands(monkeypatch) -> None:
+    """Verifies that casual questions like '오늘날씨는?' do NOT trigger an unrequested 3-Stage scan,
+    and natural phrases like 'cm session쳐봐.\\' and '모델 관리' route accurately."""
+    from google.adk.artifacts import InMemoryArtifactService
+    from google.adk.runners import Runner
+    from google.adk.sessions import InMemorySessionService
+
+    from app.agent import app as adk_app
+
+    monkeypatch.setenv("CM_DISABLE_LLM_NETWORK", "true")
+    session_service = InMemorySessionService()
+    artifact_service = InMemoryArtifactService()
+    session = session_service.create_session_sync(
+        user_id="conv_user", app_name=adk_app.name
+    )
+    runner = Runner(
+        app=adk_app,
+        session_service=session_service,
+        artifact_service=artifact_service,
+    )
+
+    def _chat(prompt_text: str) -> str:
+        msg = genai_types.Content(
+            role="user",
+            parts=[genai_types.Part.from_text(text=prompt_text)],
+        )
+        evs = list(
+            runner.run(
+                user_id="conv_user", session_id=session.id, new_message=msg
+            )
+        )
+        assert evs
+        return evs[-1].content.parts[0].text
+
+    # 1. Run sample scan first so workspace has files
+    scan_out = _chat("샘플 진단 실행")
+    assert "CodeMender 3-Stage 보안 진단 및 패치 리포트" in scan_out
+
+    # 2. Ask "오늘날씨는?" -> MUST NOT re-run the 3-Stage scan!
+    weather_out = _chat("오늘날씨는?")
+    assert "CodeMender 3-Stage 보안 진단 및 패치 리포트" not in weather_out
+    assert "오늘날씨는?" in weather_out or "날씨" in weather_out
+
+    # 3. Ask "cm session쳐봐.\\" -> MUST route to `cm sessions` timeline, NOT help table!
+    sess_out = _chat("cm session쳐봐.\\")
+    assert "cm sessions" in sess_out
+    assert "명령 실행 타임라인" in sess_out
+    assert "전체 명령어 및 기능 가이드" not in sess_out
+
+    # 4. Ask "모델 관리" -> MUST route to `cm models` table!
+    model_out = _chat("모델 관리")
+    assert "cm models" in model_out
+    assert "gemini-3.8-flash" in model_out
+    assert "ACTIVE" in model_out
+
+

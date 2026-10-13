@@ -845,15 +845,15 @@ async def _codemender_before_agent_callback_inner(
                     ],
                 )
 
-    # 7. If workspace has no files yet OR user sends a greeting/help query, return onboarding guide
+    # 7. If user sends an explicit greeting or help request, return onboarding guide
     is_greeting_or_help = bool(
         user_text_lower
         and any(
             kw in user_text_lower
-            for kw in ("안녕", "hello", "hi", "도움말", "help", "사용법", "어떻게")
+            for kw in ("안녕", "반가워", "hello", "hi", "도움말", "help", "사용법")
         )
     )
-    if not ws.files or is_greeting_or_help:
+    if is_greeting_or_help or not user_text.strip():
         a2ui_messages = build_upload_prompt_surface(catalog_mode=catalog_mode)
         lead_md = _format_upload_guide_markdown(active_model=active_model)
         return types.Content(
@@ -865,24 +865,141 @@ async def _codemender_before_agent_callback_inner(
             ],
         )
 
-    # 8. If workspace already has files and user asks to scan/diagnose, run pipeline
-    runner = CodeMenderRunner(model_name=active_model)
-    pipeline_res = runner.run_pipeline(ws)
-    if pipeline_res.cost_summary is not None:
-        record_session_cost(state, pipeline_res.cost_summary)
-    state["cm_pipeline_result"] = pipeline_res.to_dict()
-    a2ui_messages = build_scan_report_surface(
-        pipeline_res,
-        catalog_mode=catalog_mode,
+    # 8. If workspace has files AND user explicitly asks to scan/diagnose the current workspace, run pipeline
+    is_explicit_scan_request = any(
+        kw in user_text_lower
+        for kw in (
+            "스캔해",
+            "진단해",
+            "검사해",
+            "취약점 찾아",
+            "취약점 탐색",
+            "코드 분석해",
+            "보안 진단",
+            "보안 스캔",
+            "다시 스캔",
+            "rescan",
+        )
     )
-    lead_md = _format_scan_report_markdown(pipeline_res)
+    if ws.files and is_explicit_scan_request:
+        runner = CodeMenderRunner(model_name=active_model)
+        pipeline_res = runner.run_pipeline(ws)
+        if pipeline_res.cost_summary is not None:
+            record_session_cost(state, pipeline_res.cost_summary)
+        state["cm_pipeline_result"] = pipeline_res.to_dict()
+        a2ui_messages = build_scan_report_surface(
+            pipeline_res,
+            catalog_mode=catalog_mode,
+        )
+        lead_md = _format_scan_report_markdown(pipeline_res)
+        return types.Content(
+            role="model",
+            parts=[
+                types.Part.from_text(
+                    text=_build_response_text(lead_md, a2ui_messages)
+                )
+            ],
+        )
+
+    # 9. Contextual & general conversational response (handles both follow-up security questions and casual queries like "오늘날씨는?")
+    chat_md = _generate_contextual_chat_response(
+        user_text=user_text,
+        ws=ws,
+        state=state,
+        active_model=active_model,
+    )
     return types.Content(
         role="model",
-        parts=[
-            types.Part.from_text(
-                text=_build_response_text(lead_md, a2ui_messages)
+        parts=[types.Part.from_text(text=chat_md)],
+    )
+
+
+def _generate_contextual_chat_response(
+    user_text: str,
+    ws: Any,
+    state: Any,
+    active_model: str,
+) -> str:
+    """Generates a natural, context-aware Korean response for general questions or contextual follow-ups without triggering unrequested scans."""
+    import os
+    from google import genai
+    from google.genai import types as genai_types
+    from app.config import CODEMENDER_FALLBACK_MODEL
+
+    ws_files = [f.relative_path for f in getattr(ws, "files", [])]
+    pipe_dict = state.get("cm_pipeline_result") if hasattr(state, "get") else None
+    gh_ctx = state.get("cm_github_repo_context") if hasattr(state, "get") else None
+    gh_auth = state.get("cm_github_auth") if hasattr(state, "get") else None
+
+    ctx_lines = [
+        f"- 현재 활성 모델: {active_model}",
+        f"- 현재 세션 워크스페이스 파일({len(ws_files)}개): {', '.join(ws_files) if ws_files else '아직 업로드/스캔된 파일 없음'}",
+    ]
+    if isinstance(gh_ctx, dict) and gh_ctx.get("repo"):
+        ctx_lines.append(
+            f"- 최근 스캔한 GitHub 레포지토리: {gh_ctx.get('repo')} (브랜치: {gh_ctx.get('branch', 'main')})"
+        )
+    if isinstance(gh_auth, dict) and gh_auth.get("login"):
+        ctx_lines.append(f"- 연동된 GitHub 계정: @{gh_auth.get('login')}")
+
+    if isinstance(pipe_dict, dict):
+        findings = pipe_dict.get("findings") or []
+        fp_count = pipe_dict.get("false_positives_filtered", 0)
+        ctx_lines.append(
+            f"- 최근 3-Stage 보안 스캔 요약: 확증 취약점 {len(findings)}건, Stage 2 오탐 제거 {fp_count}건"
+        )
+        for idx, f in enumerate(findings[:10], start=1):
+            ctx_lines.append(
+                f"  [{idx}] {f.get('vuln_id')} ({f.get('cwe_id')} · {f.get('severity')} · 상태:{f.get('patch_status')}): "
+                f"{f.get('title')} @ {f.get('file_path')}:{f.get('start_line')} — {f.get('description')}"
             )
-        ],
+
+    context_block = "\n".join(ctx_lines)
+
+    if os.getenv("CM_DISABLE_LLM_NETWORK", "false").lower() != "true":
+        prompt = (
+            "당신은 Google Cloud Gemini Enterprise에 통합된 'CodeMender Security Agent (cm v0.12.0)'입니다.\n"
+            "사용자의 질문이나 발화 의도를 정확히 파악하여 한국어로 자연스럽고 친절하며 명확하게 답변하세요.\n\n"
+            "[응답 원칙]\n"
+            "1. 사용자가 일상적인 질문(예: '오늘 날씨는?', '점심 추천해줘', '고마워', '너는 누구야?')을 하면, "
+            "절대 뚱딴지같이 보안 스캔 리포트를 쏟아내지 말고 사용자의 질문 맥락에 맞춰 먼저 자연스럽게 대답하세요. "
+            "(실시간 날씨 등 외부 센서/검색이 필요한 질문이면 클라우드 보안 에이전트 환경이라 실시간 기상 조회는 어렵다고 가볍게 안내한 뒤, "
+            "간단히 어떤 보안 진단·모델 관리·GitHub PR 작업을 도와줄 수 있는지 1~2줄로 덧붙이세요.)\n"
+            "2. 사용자가 현재 세션에서 스캔한 코드, 발견된 취약점, 패치 내용, 보안 개념(CWE/OWASP), 모델, GitHub 연동에 대해 질문하면 "
+            "아래 [현재 세션 컨텍스트]를 바탕으로 구체적이고 전문적으로 답변하세요.\n"
+            "3. 불필요하게 긴 명령어 표를 반복 출력하지 말고 핵심만 깔끔한 마크다운으로 답변하세요.\n\n"
+            f"[현재 세션 컨텍스트]\n{context_block}\n\n"
+            f"[사용자 메시지]\n{user_text}"
+        )
+        candidate_models = []
+        for m in (active_model, CODEMENDER_FALLBACK_MODEL, "gemini-2.5-flash"):
+            if m and m not in candidate_models:
+                candidate_models.append(m)
+
+        client = genai.Client(
+            vertexai=True, project=GCP_PROJECT_ID, location="global"
+        )
+        for model_name in candidate_models:
+            try:
+                resp = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        temperature=0.3,
+                    ),
+                )
+                if resp and resp.text and resp.text.strip():
+                    return resp.text.strip()
+            except Exception as err:
+                logger.debug(f"Contextual chat generation failed on {model_name}: {err}")
+
+    # Clean offline / fallback response when CM_DISABLE_LLM_NETWORK=true
+    return (
+        f"### 💬 CodeMender Security Agent (`{active_model}`)\n"
+        f"질문하신 내용(**\"{user_text}\"**)을 확인했습니다.\n\n"
+        "- 저는 **CodeMender 자율 보안 에이전트**로, 격리된 클라우드 보안 샌드박스에서 동작하기 때문에 실시간 외부 생활 정보(날씨 등)는 직접 조회하지 못하지만 코드 보안 진단·취약점 분석·패치 및 GitHub PR 생성에 관한 질문은 현재 세션 맥락에 맞춰 바로 답변해 드릴 수 있습니다.\n\n"
+        f"#### 📌 현재 세션 상태 요약\n{context_block}\n\n"
+        "> 💡 **유용한 단축 명령**: **`모델 관리`** (`cm models`) · **`세션 이력`** (`cm sessions`) · **`샘플 진단 실행`** (`cm find`) · **`비용 조회`** (`cm cost`) · **`깃허브 연동`** (`cm github login`)"
     )
 
 
