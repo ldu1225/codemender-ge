@@ -55,7 +55,14 @@ class CodeMenderMaterialCatalogProvider(A2uiCatalogProvider):
 
     def load(self) -> dict[str, Any]:
         base_schema = copy.deepcopy(BundledCatalogProvider(VERSION_0_9).load())
-        overlay = json.loads(_CATALOG_JSON_PATH.read_text(encoding="utf-8"))
+        overlay: dict[str, Any] = {}
+        try:
+            if _CATALOG_JSON_PATH.is_file():
+                overlay = json.loads(_CATALOG_JSON_PATH.read_text(encoding="utf-8"))
+            else:
+                logger.warning(f"Catalog overlay file not found: {_CATALOG_JSON_PATH}")
+        except (OSError, json.JSONDecodeError) as err:
+            logger.error(f"Failed to load custom catalog overlay: {err}")
 
         base_schema["catalogId"] = overlay.get(
             "catalogId", CODEMENDER_CUSTOM_CATALOG_ID
@@ -146,7 +153,11 @@ def validate_a2ui_payload(
         else CODEMENDER_CUSTOM_CATALOG_ID
     )
     catalog = manager.get_selected_catalog({"supportedCatalogIds": [target_id]})
-    catalog.validator.validate(messages)
+    try:
+        catalog.validator.validate(messages)
+    except Exception as exc:
+        logger.warning(f"A2UI payload validation error for mode '{catalog_mode}': {exc}")
+        raise
 
 
 def wrap_as_a2ui_datapart(message: dict[str, Any]) -> A2APart:

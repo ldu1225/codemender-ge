@@ -41,11 +41,11 @@ from app.harness.cost_tracker import (
 
 
 def _catalog_id_for_mode(catalog_mode: str) -> str:
-    return (
-        A2UI_BASIC_CATALOG_ID
-        if catalog_mode == "basic"
-        else CODEMENDER_CUSTOM_CATALOG_ID
-    )
+    if catalog_mode == "basic":
+        return A2UI_BASIC_CATALOG_ID
+    if catalog_mode == "codemender_material":
+        return CODEMENDER_CUSTOM_CATALOG_ID
+    raise ValueError(f"Unsupported catalog_mode: {catalog_mode}")
 
 
 def build_upload_prompt_surface(

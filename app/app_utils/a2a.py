@@ -135,6 +135,7 @@ def _build_terminal_message_interceptor() -> ExecuteInterceptor:
     or `task.artifacts` all receive the full agent response (TextPart + A2UI DataParts).
     """
     latest_messages: dict[str, object] = {}
+    max_entries = 1000
 
     async def _after_event(executor_context, a2a_event, adk_event):
         status = getattr(a2a_event, "status", None)
@@ -145,6 +146,8 @@ def _build_terminal_message_interceptor() -> ExecuteInterceptor:
                 else bool(getattr(status, "message", None))
             )
             if has_msg and getattr(status.message, "parts", None):
+                if len(latest_messages) >= max_entries:
+                    latest_messages.pop(next(iter(latest_messages)), None)
                 latest_messages[executor_context.session_id] = status.message
         return a2a_event
 
@@ -187,14 +190,15 @@ async def attach_a2a_routes(
     ``APP_URL``). Call once per app — typically in a FastAPI ``lifespan``, since
     the card is built asynchronously; repeated calls register duplicate routes.
     """
-    resolved_app_url = app_url or os.getenv("APP_URL", "http://127.0.0.1:8000")
+    resolved_app_url = (app_url or os.getenv("APP_URL", "http://127.0.0.1:8000")).rstrip("/")
+    normalized_rpc_path = f"/{rpc_path.lstrip('/')}"
     resolved_agent_version = agent_version or os.getenv("AGENT_VERSION", "0.1.0")
     resolved_capabilities = capabilities or _default_capabilities()
 
     agent_card = await AgentCardBuilder(
         agent=agent,
         capabilities=resolved_capabilities,
-        rpc_url=f"{resolved_app_url}{rpc_path}",
+        rpc_url=f"{resolved_app_url}{normalized_rpc_path}",
         agent_version=resolved_agent_version,
     ).build()
     del agent_card.default_input_modes[:]

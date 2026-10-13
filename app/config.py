@@ -35,7 +35,8 @@ def _load_dotenv_if_present() -> None:
             val = val.strip().strip('"').strip("'")
             if key and key not in os.environ and val:
                 os.environ[key] = val
-    except Exception:
+    except OSError:
+        # File reading/permission errors are safely ignored without masking system/runtime exceptions
         pass
 
 
@@ -113,7 +114,7 @@ ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
         ".dockerfile",
         ".txt",
         ".md",
-        ".zip",
+        ".zip",  # Guarded by MAX_ARCHIVE_FILES, MAX_TOTAL_WORKSPACE_BYTES, and Zip-Slip checks in file_manager.py
     }
 )
 

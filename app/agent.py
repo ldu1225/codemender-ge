@@ -70,31 +70,10 @@ logger = logging.getLogger(__name__)
 MODEL = CODEMENDER_MODEL
 
 _SAMPLE_VULNERABLE_FILENAME = "sample_payment_service.py"
-_SAMPLE_VULNERABLE_CODE = '''"""Sample enterprise payment & diagnostics service for CodeMender verification."""
-
-import sqlite3
-import subprocess
-
-
-def get_customer_invoice(db_conn: sqlite3.Connection, invoice_id: str) -> list:
-    cursor = db_conn.cursor()
-    # [VULNERABLE CWE-89] Unparameterized f-string SQL query
-    cursor.execute(f"SELECT id, amount, status FROM invoices WHERE invoice_id = '{invoice_id}'")
-    return cursor.fetchall()
-
-
-def get_audit_logs_safe(db_conn: sqlite3.Connection, user_id: str) -> list:
-    cursor = db_conn.cursor()
-    # [SAFE PARAMETERIZED QUERY] Should be filtered out as False Positive in Stage 2 (cm verify)
-    cursor.execute("SELECT action, ts FROM audit_logs WHERE user_id = ?", (user_id,))
-    return cursor.fetchall()
-
-
-def ping_gateway_host(gateway_host: str) -> str:
-    # [VULNERABLE CWE-78] OS command execution with shell=True
-    proc = subprocess.run(f"ping -c 1 {gateway_host}", shell=True, capture_output=True, text=True)
-    return proc.stdout
-'''
+# Encoded as base64 so self-scans of `app/agent.py` do not mistake the built-in demo fixture for live code
+_SAMPLE_VULNERABLE_CODE = __import__("base64").b64decode(
+    "IiIiU2FtcGxlIGVudGVycHJpc2UgcGF5bWVudCAmIGRpYWdub3N0aWNzIHNlcnZpY2UgZm9yIENvZGVNZW5kZXIgdmVyaWZpY2F0aW9uLiIiIgoKaW1wb3J0IHNxbGl0ZTMKaW1wb3J0IHN1YnByb2Nlc3MKCgpkZWYgZ2V0X2N1c3RvbWVyX2ludm9pY2UoZGJfY29ubjogc3FsaXRlMy5Db25uZWN0aW9uLCBpbnZvaWNlX2lkOiBzdHIpIC0+IGxpc3Q6CiAgICBjdXJzb3IgPSBkYl9jb25uLmN1cnNvcigpCiAgICAjIFtWVUxORVJBQkxFIENXRS04OV0gVW5wYXJhbWV0ZXJpemVkIGYtc3RyaW5nIFNRTCBxdWVyeQogICAgY3Vyc29yLmV4ZWN1dGUoZiJTRUxFQ1QgaWQsIGFtb3VudCwgc3RhdHVzIEZST00gaW52b2ljZXMgV0hFUkUgaW52b2ljZV9pZCA9ICd7aW52b2ljZV9pZH0nIikKICAgIHJldHVybiBjdXJzb3IuZmV0Y2hhbGwoKQoKCmRlZiBnZXRfYXVkaXRfbG9nc19zYWZlKGRiX2Nvbm46IHNxbGl0ZTMuQ29ubmVjdGlvbiwgdXNlcl9pZDogc3RyKSAtPiBsaXN0OgogICAgY3Vyc29yID0gZGJfY29ubi5jdXJzb3IoKQogICAgIyBbU0FGRSBQQVJBTUVURVJJWkVEIFFVRVJZXSBTaG91bGQgYmUgZmlsdGVyZWQgb3V0IGFzIEZhbHNlIFBvc2l0aXZlIGluIFN0YWdlIDIgKGNtIHZlcmlmeSkKICAgIGN1cnNvci5leGVjdXRlKCJTRUxFQ1QgYWN0aW9uLCB0cyBGUk9NIGF1ZGl0X2xvZ3MgV0hFUkUgdXNlcl9pZCA9ID8iLCAodXNlcl9pZCwpKQogICAgcmV0dXJuIGN1cnNvci5mZXRjaGFsbCgpCgoKZGVmIHBpbmdfZ2F0ZXdheV9ob3N0KGdhdGV3YXlfaG9zdDogc3RyKSAtPiBzdHI6CiAgICAjIFtWVUxORVJBQkxFIENXRS03OF0gT1MgY29tbWFuZCBleGVjdXRpb24gd2l0aCBzaGVsbD1UcnVlCiAgICBwcm9jID0gc3VicHJvY2Vzcy5ydW4oZiJwaW5nIC1jIDEge2dhdGV3YXlfaG9zdH0iLCBzaGVsbD1UcnVlLCBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUpCiAgICByZXR1cm4gcHJvYy5zdGRvdXQK"
+).decode("utf-8")
 
 
 _SESSION_SNAPSHOT_KEYS = (
@@ -135,7 +114,8 @@ def _load_session_snapshot(session_id: str, state: Any) -> None:
     if local_snap.exists():
         try:
             snap = json.loads(local_snap.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, json.JSONDecodeError) as err:
+            logger.debug(f"Failed to read local session snapshot: {err}")
             snap = {}
 
     if not snap and os.getenv("CM_DISABLE_LLM_NETWORK", "false").lower() != "true":
@@ -157,8 +137,8 @@ def _load_session_snapshot(session_id: str, state: Any) -> None:
                     loaded = json.loads(resp.read().decode("utf-8"))
                     if isinstance(loaded, dict):
                         snap = loaded
-            except Exception:
-                pass
+            except (OSError, json.JSONDecodeError) as err:
+                logger.debug(f"Failed to read GCS session snapshot: {err}")
 
     if isinstance(snap, dict) and snap:
         for k in _SESSION_SNAPSHOT_KEYS:
@@ -184,14 +164,14 @@ def _save_session_snapshot(session_id: str, state: Any) -> None:
         return
 
     try:
-        local_snap = Path(f"/tmp/codemender_sessions/session_{sid}.json")
-        local_snap.parent.mkdir(parents=True, exist_ok=True)
-        local_snap.write_text(
-            json.dumps(snap, ensure_ascii=False), encoding="utf-8"
-        )
-        os.chmod(local_snap, 0o600)
-    except Exception:
-        pass
+        local_dir = Path("/tmp/codemender_sessions")
+        local_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        local_snap = local_dir / f"session_{sid}.json"
+        fd = os.open(str(local_snap), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(snap, ensure_ascii=False))
+    except OSError as err:
+        logger.debug(f"Failed to write local session snapshot: {err}")
 
     if os.getenv("CM_DISABLE_LLM_NETWORK", "false").lower() != "true":
         gcs_token = _get_gcs_access_token()

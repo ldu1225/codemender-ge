@@ -27,8 +27,11 @@ from app.app_utils import services
 from app.app_utils.a2a import attach_a2a_routes
 
 load_dotenv()
+raw_origins = os.getenv("ALLOW_ORIGINS")
 allow_origins = (
-    os.getenv("ALLOW_ORIGINS", "").split(",") if os.getenv("ALLOW_ORIGINS") else None
+    [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    if raw_origins
+    else None
 )
 
 AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -93,6 +96,9 @@ if __name__ == "__main__":
     import uvicorn
 
     bind_host = os.getenv("HOST", "127.0.0.1")
-    bind_port = int(os.getenv("PORT", "8000"))
+    try:
+        bind_port = int(os.getenv("PORT", "8000"))
+    except (ValueError, TypeError):
+        bind_port = 8000
     uvicorn.run(app, host=bind_host, port=bind_port)
 

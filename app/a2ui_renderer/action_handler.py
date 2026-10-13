@@ -53,7 +53,8 @@ def extract_a2ui_action_from_parts(parts: list[Any]) -> dict[str, Any] | None:
         if not text or not isinstance(text, str):
             continue
         stripped = text.strip()
-        if stripped.startswith("{") and stripped.endswith("}"):
+        # DoS 방지를 위한 최대 크기 제한 (64KB 초과 시 파싱 건너뜀)
+        if len(stripped) <= 65536 and stripped.startswith("{") and stripped.endswith("}"):
             try:
                 payload = json.loads(stripped)
                 if isinstance(payload, dict):
@@ -131,13 +132,13 @@ def reconstruct_pipeline_result(
         else None
     )
     return CodeMenderPipelineResult(
-        workspace_id=pipeline_result_dict["workspace_id"],
-        model_used=pipeline_result_dict["model_used"],
-        engine_mode=pipeline_result_dict["engine_mode"],
-        scanned_files=pipeline_result_dict["scanned_files"],
-        total_candidates_found=pipeline_result_dict["total_candidates_found"],
-        verified_count=pipeline_result_dict["verified_count"],
-        false_positives_filtered=pipeline_result_dict["false_positives_filtered"],
+        workspace_id=str(pipeline_result_dict.get("workspace_id", "")),
+        model_used=str(pipeline_result_dict.get("model_used", "unknown")),
+        engine_mode=str(pipeline_result_dict.get("engine_mode", "standard")),
+        scanned_files=list(pipeline_result_dict.get("scanned_files", [])),
+        total_candidates_found=int(pipeline_result_dict.get("total_candidates_found", 0)),
+        verified_count=int(pipeline_result_dict.get("verified_count", 0)),
+        false_positives_filtered=int(pipeline_result_dict.get("false_positives_filtered", 0)),
         findings=findings,
         filtered_candidates=pipeline_result_dict.get("filtered_candidates", []),
         cost_summary=cost_summary,
