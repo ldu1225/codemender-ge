@@ -46,25 +46,57 @@ GITHUB_OAUTH_CLIENT_ID = (
     or "178c6fc778ccc68e1d6a"
 )
 GITHUB_OAUTH_SCOPES = "repo read:user user:email"
-LOCAL_GITHUB_AUTH_PATH = Path(
-    os.getenv("CM_GITHUB_AUTH_FILE", "/tmp/codemender_github_auth.json")
+LOCAL_GITHUB_AUTH_DIR = Path(
+    os.getenv("CM_GITHUB_AUTH_DIR", "/tmp/codemender_github_auth_sessions")
 )
-GCS_GITHUB_AUTH_OBJECT = "codemender-config/github_auth_state.json"
+GCS_GITHUB_AUTH_PREFIX = "codemender-config/sessions"
 
 
-def _load_persisted_github_state() -> dict[str, Any]:
-    """Loads persisted GitHub auth state (token or pending device_code) from local file or GCS."""
-    # 1. Check environment variable override first
+def _resolve_session_id(state: Any = None, session_id: str | None = None) -> str:
+    """Extracts a sanitized session identifier so each conversation has strictly isolated GitHub auth."""
+    raw_sid = session_id or ""
+    if not raw_sid and state is not None and hasattr(state, "get"):
+        raw_sid = str(
+            state.get("_cm_session_id")
+            or state.get("session_id")
+            or state.get("workspace_id")
+            or ""
+        )
+    cleaned = "".join(
+        ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in str(raw_sid).strip()
+    )
+    return cleaned or "ephemeral_local"
+
+
+def _get_session_local_auth_path(session_id: str) -> Path:
+    return LOCAL_GITHUB_AUTH_DIR / f"github_auth_{session_id}.json"
+
+
+def _get_session_gcs_auth_object(session_id: str) -> str:
+    return f"{GCS_GITHUB_AUTH_PREFIX}/{session_id}/github_auth_state.json"
+
+
+def _load_persisted_github_state(
+    state: Any = None, session_id: str | None = None
+) -> dict[str, Any]:
+    """Loads persisted GitHub auth state strictly scoped to the current user session."""
+    # 1. Check environment variable override first (only if explicitly configured)
     env_token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
     if env_token and env_token.strip():
         return {"access_token": env_token.strip(), "source": "env"}
 
-    # 2. Check GCS project-private config object (so multi-instance Cloud Run shares state)
+    sid = _resolve_session_id(state, session_id)
+    if sid == "ephemeral_local" and state is not None and hasattr(state, "get"):
+        sess_auth = state.get("cm_github_auth")
+        return dict(sess_auth) if isinstance(sess_auth, dict) else {}
+
+    # 2. Check session-scoped GCS config object (so only this user's session survives Cloud Run scaling)
     if os.getenv("CM_DISABLE_LLM_NETWORK", "false").lower() != "true":
         gcs_token = _get_gcs_access_token()
         if gcs_token:
             try:
-                encoded = urllib.parse.quote(GCS_GITHUB_AUTH_OBJECT, safe="")
+                gcs_obj = _get_session_gcs_auth_object(sid)
+                encoded = urllib.parse.quote(gcs_obj, safe="")
                 url = (
                     f"https://storage.googleapis.com/storage/v1/b/"
                     f"{GCS_ARTIFACT_BUCKET}/o/{encoded}?alt=media"
@@ -84,12 +116,11 @@ def _load_persisted_github_state() -> dict[str, Any]:
             except Exception:
                 pass
 
-    # 3. Fallback to local file
-    if LOCAL_GITHUB_AUTH_PATH.exists():
+    # 3. Fallback to session-scoped local file
+    local_path = _get_session_local_auth_path(sid)
+    if local_path.exists():
         try:
-            data = json.loads(
-                LOCAL_GITHUB_AUTH_PATH.read_text(encoding="utf-8")
-            )
+            data = json.loads(local_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 return data
         except Exception:
@@ -97,14 +128,18 @@ def _load_persisted_github_state() -> dict[str, Any]:
     return {}
 
 
-def _save_persisted_github_state(data: dict[str, Any]) -> None:
-    """Saves GitHub auth state to both local file (`0o600`) and project-private GCS bucket."""
+def _save_persisted_github_state(
+    data: dict[str, Any], state: Any = None, session_id: str | None = None
+) -> None:
+    """Saves GitHub auth state strictly under the current session's local file (`0o600`) and GCS path."""
+    sid = _resolve_session_id(state, session_id)
+    local_path = _get_session_local_auth_path(sid)
     try:
-        LOCAL_GITHUB_AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
-        LOCAL_GITHUB_AUTH_PATH.write_text(
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_text(
             json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
         )
-        os.chmod(LOCAL_GITHUB_AUTH_PATH, 0o600)
+        os.chmod(local_path, 0o600)
     except Exception:
         pass
 
@@ -112,7 +147,8 @@ def _save_persisted_github_state(data: dict[str, Any]) -> None:
         gcs_token = _get_gcs_access_token()
         if gcs_token:
             try:
-                encoded = urllib.parse.quote(GCS_GITHUB_AUTH_OBJECT, safe="")
+                gcs_obj = _get_session_gcs_auth_object(sid)
+                encoded = urllib.parse.quote(gcs_obj, safe="")
                 url = (
                     f"https://storage.googleapis.com/upload/storage/v1/b/"
                     f"{GCS_ARTIFACT_BUCKET}/o?uploadType=media&name={encoded}"
@@ -209,7 +245,7 @@ def start_github_device_flow(state: Any = None) -> dict[str, Any]:
     with urllib.request.urlopen(req, timeout=10.0) as resp:
         res = json.loads(resp.read().decode("utf-8"))
 
-    persisted = _load_persisted_github_state()
+    persisted = _load_persisted_github_state(state=state)
     persisted.update(
         {
             "pending_device_code": res.get("device_code", ""),
@@ -224,7 +260,7 @@ def start_github_device_flow(state: Any = None) -> dict[str, Any]:
             ),
         }
     )
-    _save_persisted_github_state(persisted)
+    _save_persisted_github_state(persisted, state=state)
     if state is not None and hasattr(state, "__setitem__"):
         state["cm_github_auth"] = persisted
     return persisted
@@ -235,7 +271,7 @@ def poll_or_verify_github_auth(
     explicit_token: str | None = None,
 ) -> dict[str, Any]:
     """Checks if a user is authenticated with GitHub, or exchanges a pending `device_code` for an `access_token`."""
-    persisted = _load_persisted_github_state()
+    persisted = _load_persisted_github_state(state=state)
     if state is not None and hasattr(state, "get"):
         sess_auth = state.get("cm_github_auth")
         if isinstance(sess_auth, dict):
@@ -295,13 +331,13 @@ def poll_or_verify_github_auth(
                 persisted["scope"] = token_res.get("scope", GITHUB_OAUTH_SCOPES)
                 persisted.pop("pending_device_code", None)
                 persisted.pop("user_code", None)
-                _save_persisted_github_state(persisted)
+                _save_persisted_github_state(persisted, state=state)
             elif isinstance(token_res, dict) and token_res.get("error") in (
                 "expired_token",
                 "access_denied",
             ):
                 persisted.pop("pending_device_code", None)
-                _save_persisted_github_state(persisted)
+                _save_persisted_github_state(persisted, state=state)
                 return {
                     "authenticated": False,
                     "reason": token_res.get("error"),
@@ -333,7 +369,7 @@ def poll_or_verify_github_auth(
                     or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }
             )
-            _save_persisted_github_state(persisted)
+            _save_persisted_github_state(persisted, state=state)
             if state is not None and hasattr(state, "__setitem__"):
                 state["cm_github_auth"] = persisted
             return persisted
@@ -341,7 +377,7 @@ def poll_or_verify_github_auth(
             # Invalid/revoked token
             persisted.pop("access_token", None)
             persisted["authenticated"] = False
-            _save_persisted_github_state(persisted)
+            _save_persisted_github_state(persisted, state=state)
 
     if persisted.get("pending_device_code"):
         return {
@@ -357,8 +393,8 @@ def poll_or_verify_github_auth(
 
 
 def logout_github_auth(state: Any = None) -> None:
-    """Clears stored GitHub authentication state."""
-    _save_persisted_github_state({})
+    """Clears stored GitHub authentication state for the current session."""
+    _save_persisted_github_state({}, state=state)
     if state is not None and hasattr(state, "__setitem__"):
         state["cm_github_auth"] = {}
 

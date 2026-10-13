@@ -758,6 +758,8 @@ async def execute_cm_command(
     )
 
     t0 = time.monotonic()
+    if state is not None and hasattr(state, "__setitem__"):
+        state["_cm_session_id"] = workspace.session_id
     sub = parsed_cmd.get("subcommand", "help").lower()
     positional: list[str] = parsed_cmd.get("positional") or []
     active_model = (
