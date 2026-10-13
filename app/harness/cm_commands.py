@@ -2120,10 +2120,22 @@ async def execute_cm_command(
             from app.agent import _format_scan_report_markdown
 
             scan_md = _format_scan_report_markdown(pipeline_res)
+            can_push = bool(fetch_res.get("can_push", True))
+            repo_owner = str(fetch_res.get("owner") or fetch_res["repo"].split("/")[0])
+            if can_push:
+                pr_guide_line = (
+                    f"- **자동 PR 생성 안내**: 패치 확인 후 채팅창에 **`깃허브 PR 생성`** (또는 **`cm github pr {fetch_res['repo']}`**)이라고 입력하시면 "
+                    f"해당 GitHub 레포지토리에 보안 패치 브랜치 커밋과 Pull Request가 즉시 생성됩니다!\n\n---\n\n"
+                )
+            else:
+                pr_guide_line = (
+                    f"- **🔒 외부 저장소 권한 안내**: `{fetch_res['repo']}`는 외부 타인(`@{repo_owner}`) 소유 저장소로 현재 계정(`@{gh_login}`)에는 **읽기 전용(Read-Only)** 권한만 있습니다. "
+                    f"타인 저장소에는 직접 브랜치/PR을 생성할 수 없으므로, **`패치 적용`** 후 **`다운로드`**(`cm artifacts`)로 수정본을 받으시거나 본인 계정으로 **Fork**한 뒤 PR을 생성해 주세요.\n\n---\n\n"
+                )
             header_md = (
                 f"### 🐙 GitHub 레포지토리 실시간 연동 스캔 완료: [`{fetch_res['repo']}`]({fetch_res.get('html_url', '')}) (브랜치: `{fetch_res['branch']}`)\n"
                 f"- **GitHub 계정**: `@{gh_login}` | **가져온 소스 파일 ({len(fetch_res['fetched_files'])}개)**: `{', '.join(fetch_res['fetched_files'])}`\n"
-                f"- **자동 PR 생성 안내**: 패치 확인 후 채팅창에 **`깃허브 PR 생성`** (또는 **`cm github pr {fetch_res['repo']}`**)이라고 입력하시면 해당 GitHub 레포지토리에 보안 패치 브랜치 커밋과 Pull Request가 즉시 생성됩니다!\n\n---\n\n"
+                + pr_guide_line
             )
             return {
                 "markdown": header_md + scan_md,

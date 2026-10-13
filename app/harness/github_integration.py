@@ -591,9 +591,16 @@ def fetch_github_repo_files_into_workspace(
             "message": f"GitHub 레포지토리 `{clean_repo}` (브랜치: `{target_branch}`)에서 스캔 가능한 소스 코드 파일을 찾지 못했습니다.",
         }
 
+    perms = repo_meta.get("permissions") if isinstance(repo_meta.get("permissions"), dict) else {}
+    owner_info = repo_meta.get("owner") if isinstance(repo_meta.get("owner"), dict) else {}
+    repo_owner = str(owner_info.get("login") or clean_repo.split("/")[0])
+    can_push = bool(perms.get("push", True)) if perms else True
+
     repo_ctx = {
         "status": "ok",
         "repo": clean_repo,
+        "owner": repo_owner,
+        "can_push": can_push,
         "branch": target_branch,
         "html_url": repo_meta.get("html_url", f"https://github.com/{clean_repo}"),
         "fetched_files": fetched_files,
@@ -726,6 +733,29 @@ def create_github_pr_or_push_patches(
             "message": f"GitHub 레포지토리 `{repo_full_name}` 조회 실패: {repo_info.get('message', st_repo)}",
         }
 
+    # Check if the authenticated user has write (push) permission on the target repository
+    repo_perms = repo_info.get("permissions") if isinstance(repo_info.get("permissions"), dict) else {}
+    repo_owner_info = repo_info.get("owner") if isinstance(repo_info.get("owner"), dict) else {}
+    repo_owner_login = str(repo_owner_info.get("login") or repo_full_name.split("/")[0])
+    repo_short = repo_full_name.split("/")[-1]
+    has_push_perm = bool(repo_perms.get("push", True)) if repo_perms else (
+        not login or repo_owner_login.lower() == login.lower()
+    )
+    if not created_new and not has_push_perm:
+        return {
+            "status": "error",
+            "message": (
+                f"**외부 타인 소유 저장소 쓰기(Push) 권한 없음**: 현재 연동된 GitHub 계정(`@{login}`)은 "
+                f"**[`{repo_full_name}`](https://github.com/{repo_full_name})** (소유자: `@{repo_owner_login}`) 저장소에 대한 "
+                f"**쓰기(Write/Push) 권한이 없습니다** (읽기 전용 스캔만 가능).\n"
+                f"  - **원인**: GitHub 보안 정책상 본인 소유가 아니거나 Collaborator 권한이 없는 타인의 저장소에는 직접 패치 브랜치를 생성하거나 커밋할 수 없습니다.\n"
+                f"  - **해결 방법**:\n"
+                f"    1. **내 저장소에 PR 생성**: `내 레포 목록` (`cm github repos`)에서 본인 소유 저장소를 스캔한 뒤 `pr만들어봐`를 실행하세요.\n"
+                f"    2. **타인 오픈소스 Fork 후 PR**: GitHub에서 해당 저장소를 본인 계정(`@{login}/{repo_short}`)으로 **Fork**한 뒤 `cm github pr {login}/{repo_short}`를 실행하세요.\n"
+                f"    3. **패치 파일 직접 다운로드**: 채팅창에 **`패치 적용`** 후 **`다운로드`** (`cm artifacts`)를 입력하면 수정된 전체 소스코드를 즉시 다운로드할 수 있습니다."
+            ),
+        }
+
     base_branch = str(
         gh_meta.get("branch") or repo_info.get("default_branch") or "main"
     )
@@ -827,6 +857,15 @@ def create_github_pr_or_push_patches(
         body={"ref": f"refs/heads/{patch_branch}", "sha": base_sha},
     )
     if st_br not in (200, 201):
+        if st_br in (403, 404):
+            return {
+                "status": "error",
+                "message": (
+                    f"**GitHub 저장소 쓰기(Push) 권한 부족**: `@{login}` 계정에 `{repo_full_name}` 저장소의 브랜치 생성/푸시 권한이 없습니다 "
+                    f"(GitHub API 응답: `{br_data.get('message', st_br)}`). "
+                    f"타인 소유 저장소인 경우 본인 계정으로 Fork한 뒤 실행하시거나, OAuth 토큰의 `repo` 권한을 확인해 주세요."
+                ),
+            }
         return {
             "status": "error",
             "message": f"패치 브랜치 `{patch_branch}` 생성 실패: {br_data.get('message', st_br)}",
