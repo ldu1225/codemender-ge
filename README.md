@@ -39,9 +39,10 @@
 
 | 영역 | 핵심 기능 | 기술적 특징 |
 | :--- | :--- | :--- |
-| **🔍 3-Stage 자율 보안 엔진** | `cm find` → `cm verify` → `cm fix` | 정적/의미론적 스캔(Stage 1) → 샌드박스 AST/데이터흐름 검증으로 오탐(False Positive) 제거(Stage 2) → LLM-as-a-Judge 채점 및 퍼지 매칭 보안 패치 합성(Stage 3) |
+| **🧠 멀티턴 맥락 & 의도 라우터** | `cm_chat_history` + LLM Intent Router | 하드코딩 키워드 매칭의 한계를 넘어 직전 대화 맥락(`"codemender-ge레포"` → `"sample폴더외에 다 스캔해"` → `"뭔데 이게"`)을 기억하고, 일반 질문·파일 출처 질문·보안 명령을 정확히 분기 |
+| **🔍 3-Stage 자율 보안 엔진** | `cm find` → `cm verify` → `cm fix` | 정적/의미론적 스캔(Stage 1) → 샌드박스 AST/데이터흐름 검증으로 오탐(False Positive) 제거(Stage 2) → 상대 들여쓰기 보존 및 `ast.parse` 구문 무결성 검증 패치 합성(Stage 3) |
 | **🔒 멀티유저 세션 완벽 격리** | `session_id` 기반 GitHub 토큰 & 워크스페이스 분리 | 다수의 임직원이 동시에 사용해도 사용자 A의 개인 GitHub OAuth 토큰과 스캔 코드가 사용자 B에게 절대 노출되지 않으며, Cloud Run 오토스케일링 시에도 세션별 GCS 스냅샷으로 무중단 복원 |
-| **🐙 GitHub OAuth & 자율 PR** | 원격 리포지토리 스캔 & Pull Request 자동 오픈 | 별도 MCP 서버 없이 순수 GitHub REST API v3 + OAuth Device Flow(`github.com/login/device`)로 원격 트리 스캔 → 보안 브랜치 생성 → 패치 파일 커밋 → PR 자동 생성 |
+| **🐙 GitHub OAuth · 경로 제외 스캔 · 자율 PR** | 원격 리포지토리 필터 스캔 & Pull Request 자동 오픈 | 비공개/공개 레포 필터 조회(`내 레포 목록 프라이빗만`), 특정 폴더 제외 스캔(`sample폴더외에 다 스캔해`), 외부 타인 레포 권한(`can_push`) 자동 판별 및 보안 PR 자동 생성 |
 | **🖥️ A2A v0.3.0 & A2UI v0.9** | 양방향 인터랙티브 보안 대시보드 | Gemini Enterprise 채팅창 호환 고가독성 Markdown 리포트 + A2UI v0.9 카탈로그(`SeverityBadge`, `CodeDiff`, `PatchApprovalGate`) 동시 방출 |
 | **📥 GCS 원클릭 다운로드** | 패치 완료 파일 & ZIP 패키지 영구 보관 | 컨테이너 임시 디스크(`/tmp`)의 한계를 극복하여 고객의 GCS 버킷(`gs://<PROJECT>-a2a-bucket`)에 자동 동기화 및 브라우저 즉시 다운로드 링크 제공 |
 | **💰 온디맨드 비용 텔레메트리** | Billing API 권한 없이 실시간 비용 정산 | 평소 작업 시에는 화면 노이즈를 만들지 않으며, 사용자가 `오늘 비용 산출해줘` 또는 `cm cost`를 호출할 때만 Cloud Logging과 영구 원장을 대조해 KST 기준 USD·KRW 정산 명세서 출력 |
@@ -67,8 +68,8 @@ flowchart TB
 
     subgraph CloudRun["☁️ Google Cloud Run Gen2 (codemender-ge)"]
         FastAPI["⚡ FastAPI A2A Server<br/>(POST /a2a/app & /run_sse)"]
-        Agent["🧠 ADK Root Agent<br/>(Session Snapshot Rehydration)"]
-        Harness["🛠️ CodeMender 3-Stage Harness<br/>• cm_commands.py (자연어 & CLI 라우터)<br/>• cm_runner.py (Find → Verify → Fix)<br/>• patch_applier.py (AST & Fuzzy Patch)<br/>• github_integration.py (OAuth & Auto PR)"]
+        Agent["🧠 ADK Root Agent<br/>(Multi-Turn Intent Router & Session Rehydration)"]
+        Harness["🛠️ CodeMender 3-Stage Harness<br/>• cm_commands.py (자연어/맥락 & CLI 라우터)<br/>• cm_runner.py (Find → Verify → Fix)<br/>• patch_applier.py (AST 구문 무결성 & 상대 들여쓰기 보존)<br/>• github_integration.py (OAuth / 폴더 제외 스캔 / Auto PR)"]
         A2UI["🎨 A2UI v0.9 Surface Builder<br/>(CodeDiff & Security Gate)"]
 
         FastAPI --> Agent
@@ -90,7 +91,7 @@ flowchart TB
     UserA & UserB <-->|"독립 세션 대화 (session_id 분리)"| Assistant
     Assistant <-->|"IAM roles/run.invoker"| FastAPI
     Harness <-->|"3-Stage 추론 & LLM Judge"| GEAP
-    Agent <-->|"세션별 상태/OAuth 토큰 격리 동기화"| GCS
+    Agent <-->|"세션별 상태/대화이력/OAuth 토큰 격리 동기화"| GCS
     Harness <-->|"패치 아티팩트 & 비용 원장 저장"| GCS
     Harness <-->|"구조화 비용 로그 방출/조회"| Logging
     Harness <-->|"유저별 OAuth 토큰 발급"| DeviceFlow
@@ -405,16 +406,20 @@ GITHUB_TOKEN=""
 
 ## 💻 5. Gemini Enterprise 실전 사용 가이드 (실제 화면 & 5대 시나리오)
 
-Gemini Enterprise 웹 콘솔 좌측 메뉴의 **Agents** 탭에서 `CodeMender Security Agent (Gemini 3.8 Flash)`를 선택하고 아래 시나리오대로 대화해 보세요. 띄어쓰기 없는 자연어(예: `내레포목록`, `깃허브스캔`, `패치적용`, `pr만들어봐`, `모델 관리`)와 일상 질문/후속 질문도 모두 자연스럽게 인식합니다.
+Gemini Enterprise 웹 콘솔 좌측 메뉴의 **Agents** 탭에서 `CodeMender Security Agent (Gemini 3.8 Flash)`를 선택하고 아래 시나리오대로 대화해 보세요. 띄어쓰기 없는 자연어(예: `내래포목록 프라이빗만`, `codemender-ge레포`, `sample폴더외에 다 스캔해`, `패치적용`, `pr만들어봐`, `모델 관리`)와 일상 질문/후속 질문도 **멀티턴 대화 맥락(`cm_chat_history`)과 의도 라우터**가 자연스럽게 인식합니다.
 
-### 시나리오 1: GitHub 저장소 원격 스캔 및 자율 보안 PR 생성 (`cm github`)
+### 시나리오 1: GitHub 저장소 멀티턴 맥락 스캔 · 폴더 제외 스캔 · 자율 보안 PR 생성 (`cm github`)
 1. `깃허브 연동` (`cm github login`) 입력 → 화면에 안내된 [https://github.com/login/device](https://github.com/login/device) 링크를 클릭하고 **8자리 인증 코드** 입력 (내 현재 대화 세션에만 안전하게 격리 연동됨)
-2. `내 레포 목록` (`cm github repos`) 입력 → 내 GitHub 계정의 퍼블릭/프라이빗 리포지토리 목록 확인
-3. `https://github.com/<소유자>/<저장소명> 이거 스캔해줘` 입력 → GitHub 저장소의 소스 파일들을 자동으로 가져와 3-Stage 보안 스캔 수행 및 오탐 제거 리포트 확인
-4. `패치 적용` (또는 `cm fix ALL`) 입력 → 검출된 취약점 일괄 보안 패치 적용 및 구문 무결성 검증
+2. `내 레포 목록` 또는 `내 래포목록 프라이빗만` (`cm repo list --visibility private`) 입력 → 내 GitHub 계정의 전체 또는 비공개(Private)/공개(Public) 리포지토리 필터 조회
+3. **방법 A (직접 URL/이름 스캔)**: `https://github.com/<소유자>/<저장소명> 이거 스캔해줘` 입력  
+   **방법 B (멀티턴 맥락 & 폴더 제외 스캔)**:
+   - 1턴: `codemender-ge레포` 입력 → 에이전트가 해당 저장소를 현재 세션의 타겟 레포지토리(`cm_target_repo`)로 설정하고 원하는 작업을 안내
+   - 2턴: `sample폴더외에 다 스캔해` 입력 → 직전 턴에 지정한 `codemender-ge` 저장소에서 `sample`, `samples` 디렉터리를 자동으로 제외(`exclude_paths`)하고 나머지 소스 파일만 가져와 3-Stage 보안 스캔 수행
+   - 3턴: `뭔데 이게` 또는 `이 파일이 지금 어디에 있는건데?` 입력 → 불필요한 재스캔 없이 방금 실행된 진단 리포트 내용과 파일 출처(GitHub 원격 저장소 vs 컨테이너 내장 데모 파일)를 맥락에 맞게 설명
+4. `패치 적용` (또는 `cm fix ALL`) 입력 → 검출된 취약점 일괄 보안 패치 적용 (`ast.parse` 구문 무결성 및 상대 들여쓰기 자동 보존)
 5. `해당 수정사항 github pr생성` (또는 `pr만들어봐`) 입력 →
    - 스캔했던 리포지토리를 자동으로 기억하여 원격 GitHub 저장소에 `codemender/security-fix-YYYYMMDD-*` 브랜치 자동 생성
-   - 패치된 모든 파일 자동 커밋 및 **실제 GitHub Pull Request 자동 오픈**
+   - 패치된 모든 파일 자동 커밋 및 **실제 GitHub Pull Request 자동 오픈** (타인의 공개 저장소처럼 Push 권한이 없는 레포지토리인 경우 스캔 시점부터 `Read-Only` 권한을 감지하여 Fork 가이드를 친절히 안내)
 
 ### 시나리오 2: 원클릭 샘플 보안 진단 및 자동 패치
 1. `안녕` 입력 → 에이전트가 지원하는 전체 `cm` 명령어 가이드 및 상태 대시보드 확인
@@ -458,7 +463,7 @@ Gemini Enterprise 웹 콘솔 좌측 메뉴의 **Agents** 탭에서 `CodeMender S
 | **10** | **온디맨드 비용 정산** | `cm cost` / `오늘 비용 산출해줘` / `비용 조회` | Cloud Logging + 영구 원장 기반 일자별·세션별 토큰 및 비용(USD/KRW) 정산 |
 | **11** | **세션 타임라인** | `cm sessions` / `세션 이력` | 현재 세션의 명령어 실행 이력 및 단계별 소요 시간/비용 타임라인 |
 | **12** | **아티팩트 다운로드** | `cm artifacts` / `cm download` / `다운로드` | 패치된 파일 및 `.zip` 번들의 GCS 원클릭 다운로드 링크 및 전체 소스 출력 |
-| **13** | **GitHub 연동 & PR** | `깃허브 연동` / `내 레포 목록` / `<URL> 스캔해줘` / `pr만들어봐` | 세션 격리 GitHub OAuth 인증, 저장소 목록, 원격 코드 스캔, 자율 보안 PR 생성 |
+| **13** | **GitHub 연동 & PR** | `깃허브 연동` / `내 래포목록 프라이빗만` / `<URL> 스캔해줘` / `pr만들어봐` | 세션 격리 GitHub OAuth 인증, 공개/비공개 저장소 필터 조회, 폴더 제외 원격 코드 스캔, 자율 보안 PR 생성 |
 
 ---
 
@@ -484,7 +489,7 @@ codemender-ge/
 │   └── vulnerable_gateway.c         # C 샘플 취약 코드 (Buffer Overflow, Format String 등)
 ├── app/
 │   ├── config.py                    # Zero-Hardcoding 동적 환경 변수 로더 (.env 자동 로드)
-│   ├── agent.py                     # ADK Root Agent & 세션별 GCS 스냅샷 복원/저장 및 맥락 대화 오케스트레이터
+│   ├── agent.py                     # ADK Root Agent & 멀티턴 의도 라우터(_classify_user_intent) 및 세션 스냅샷 복원기
 │   ├── fast_api_app.py              # Cloud Run FastAPI 서버 (/a2a/app 및 /run_sse 엔드포인트)
 │   ├── a2ui_renderer/
 │   │   ├── catalogs/
@@ -493,16 +498,16 @@ codemender-ge/
 │   │   ├── schema_manager.py        # A2A <-> ADK 이벤트 변환 및 A2UI DataPart 주입기
 │   │   └── surface_builder.py       # A2UI v0.9 인터랙티브 대시보드 및 CodeDiff 빌더
 │   ├── harness/
-│   │   ├── cm_commands.py           # cm v0.12.0 13개 명령어/자연어 파서 및 리포트 생성기
+│   │   ├── cm_commands.py           # cm v0.12.0 13개 명령어/자연어/맥락 파서 및 리포트 생성기
 │   │   ├── cm_runner.py             # 3-Stage (find -> verify -> fix) 파이프라인 실행 엔진
-│   │   ├── patch_applier.py         # AST 검증 + 들여쓰기/라인 범위 퍼지 매칭 패치 엔진
-│   │   ├── github_integration.py    # 세션별(session_id) GitHub OAuth, 원격 스캔, 자율 PR 생성기
+│   │   ├── patch_applier.py         # AST 구문 무결성 검증(ast.parse) + 상대 들여쓰기 보존 퍼지 패치 엔진
+│   │   ├── github_integration.py    # 세션별(session_id) GitHub OAuth, 폴더 제외 원격 스캔, 자율 PR 생성기
 │   │   └── cost_tracker.py          # Cloud Logging + GCS 영구 비용 원장 온디맨드 정산기
 │   └── ingestion/
 │       └── file_manager.py          # 격리 워크스페이스 관리, ZIP/파일 인제스천, GCS 퍼블리셔
 └── tests/
-    ├── unit/                        # 단위 테스트 스위트 (16개 핵심 보안/세션격리/맥락대화 검증 케이스)
-    └── integration/                 # 통합 테스트 스위트
+    ├── unit/                        # 단위 테스트 스위트 (17개 핵심 보안/세션격리/멀티턴맥락/AST패치 검증 케이스)
+    └── integration/                 # 통합 테스트 스위트 (3개 에이전트/서버 E2E 검증 케이스)
 ```
 
 ---
@@ -526,8 +531,8 @@ codemender-ge/
 # 5. Cloud Run 실시간 로그 확인
 ./scripts/deploy_and_register_ge.sh --logs
 
-# 6. 로컬 단위 테스트 실행 (16개 케이스)
-uv run pytest tests/unit -v
+# 6. 로컬 단위 및 통합 테스트 실행 (20개 케이스)
+uv run pytest tests/unit tests/integration -v
 ```
 
 ### 자주 묻는 질문 (Troubleshooting)
@@ -536,8 +541,8 @@ uv run pytest tests/unit -v
   - **절대 접근되지 않습니다.** GitHub OAuth 토큰과 스캔된 워크스페이스는 각 사용자의 대화 세션 ID(`session_id`)별로 완전히 분리된 GCS 경로(`gs://<BUCKET>/codemender-config/sessions/<session_id>/`)와 `0o600` 권한의 로컬 파일에 격리 저장됩니다. 새로운 채팅방이나 다른 사용자는 본인이 직접 `깃허브 연동`을 수행하기 전까지 타인의 GitHub 계정이나 리포지토리에 일절 접근할 수 없습니다.
 - **Q2. `GE_ENGINE_ID`를 어디서 확인하나요?**
   - 확인하실 필요가 없습니다! `.env` 파일에서 `GE_ENGINE_ID=""`로 비워두시면 `./scripts/deploy_and_register_ge.sh`가 프로젝트 내 Discovery Engine 목록을 조회하여 자동으로 최신 Gemini Enterprise 엔진을 연결합니다.
-- **Q3. GitHub PR 생성 시 레포지토리 이름을 매번 다시 적어줘야 하나요?**
-  - 적어주지 않아도 됩니다! 직전에 스캔한 GitHub 레포지토리 컨텍스트(`cm_github_repo_context`)가 세션 스냅샷에 자동 보존되므로, 스캔 및 패치 적용 후 단순히 `pr만들어봐` 또는 `해당 수정사항 github pr생성`이라고만 입력해도 자동으로 해당 리포지토리에 브랜치를 생성하고 PR을 오픈합니다.
+- **Q3. GitHub 스캔이나 PR 생성 시 레포지토리 이름을 매번 다시 적어줘야 하나요?**
+  - 적어주지 않아도 됩니다! 예를 들어 1턴에 `codemender-ge레포`라고 말한 뒤 2턴에 `sample폴더외에 다 스캔해`라고 입력하면 직전에 언급한 `codemender-ge` 저장소를 기억하여 `sample`/`samples` 폴더를 제외하고 스캔하며, 패치 적용 후 `pr만들어봐`라고만 입력해도 해당 저장소에 브랜치를 생성하고 PR을 오픈합니다.
 
 ---
 

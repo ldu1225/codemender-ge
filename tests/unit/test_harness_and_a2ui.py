@@ -637,6 +637,44 @@ def test_github_pr_routing_and_vcs_stage_auto_apply(monkeypatch) -> None:
     assert res.applied is True
     assert '    exec(code_str, {"__builtins__": {}}, namespace)' in res.patched_content
 
+    # Verify AST syntax validation rejects syntax-breaking patches and preserves relative multi-line indentation
+    multiline_code = (
+        "class Runner:\n"
+        "    def run(self, cmd):\n"
+        "        res = subprocess.run(cmd, shell=True)\n"
+        "        return res.returncode\n"
+    )
+    ingest_bytes_into_workspace(
+        ws,
+        "runner_service.py",
+        multiline_code.encode("utf-8"),
+    )
+    res_multi = apply_patch_to_workspace(
+        ws,
+        vuln_id="CM-CWE-78-001",
+        file_path="runner_service.py",
+        before_snippet="res = subprocess.run(cmd, shell=True)\nreturn res.returncode",
+        after_snippet="if isinstance(cmd, str):\n    cmd = shlex.split(cmd)\nres = subprocess.run(cmd, shell=False)\nreturn res.returncode",
+        start_line=3,
+        end_line=4,
+    )
+    assert res_multi.applied is True
+    assert "        if isinstance(cmd, str):\n            cmd = shlex.split(cmd)\n" in res_multi.patched_content
+    assert "Applied verified security remediation" not in res_multi.patched_content
+
+    # Syntax-invalid patch MUST be rejected so original code is never corrupted
+    res_bad = apply_patch_to_workspace(
+        ws,
+        vuln_id="CM-CWE-78-002",
+        file_path="runner_service.py",
+        before_snippet="res = subprocess.run(cmd, shell=False)",
+        after_snippet="def broken_syntax(:\n    pass",
+        start_line=5,
+        end_line=5,
+    )
+    assert res_bad.applied is False
+
+
 
 def test_multi_user_session_isolation_and_snapshot_rehydration(monkeypatch) -> None:
     """Verifies that User A's personal GitHub OAuth token and workspace snapshot in Session A

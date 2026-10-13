@@ -65,6 +65,44 @@ def build_unified_diff(
     return "".join(diff_iter)
 
 
+def _reindent_after_lines(
+    after_lines: list[str], base_indent: str
+) -> list[str]:
+    """Re-indents `after_lines` so its first non-empty line aligns with `base_indent` while preserving relative block indentation."""
+    first_after_nonempty = next((ln for ln in after_lines if ln.strip()), "")
+    after_base_len = len(first_after_nonempty) - len(first_after_nonempty.lstrip())
+    base_indent_len = len(base_indent)
+    reindented: list[str] = []
+    for aln in after_lines:
+        if not aln.strip():
+            reindented.append("")
+        else:
+            aln_indent_len = len(aln) - len(aln.lstrip())
+            rel_indent = max(0, aln_indent_len - after_base_len)
+            reindented.append((" " * (base_indent_len + rel_indent)) + aln.lstrip())
+    return reindented
+
+
+def _is_valid_syntax_after_patch(
+    file_path: str, original_content: str, candidate_content: str
+) -> bool:
+    """Ensures that applying a patch to a Python file never introduces a SyntaxError or IndentationError."""
+    if not file_path.endswith(".py"):
+        return True
+    import ast
+
+    try:
+        ast.parse(original_content)
+    except SyntaxError:
+        # If the original snippet in a synthetic unit test wasn't a full module, allow replacement
+        return True
+    try:
+        ast.parse(candidate_content)
+        return True
+    except SyntaxError:
+        return False
+
+
 def _fuzzy_replace_snippet(
     current_content: str,
     before_snippet: str,
@@ -75,20 +113,21 @@ def _fuzzy_replace_snippet(
     file_path: str = "",
 ) -> str | None:
     """Matches and replaces `before_snippet` in `current_content` even if the LLM trimmed leading indentation."""
-    if not before_snippet and not after_snippet:
+    if not before_snippet or not after_snippet:
         return None
-    if before_snippet and before_snippet in current_content:
-        return current_content.replace(before_snippet, after_snippet, 1)
+    if before_snippet in current_content:
+        direct_cand = current_content.replace(before_snippet, after_snippet, 1)
+        if _is_valid_syntax_after_patch(file_path, current_content, direct_cand):
+            return direct_cand
 
     cur_lines = current_content.splitlines()
     before_lines = [ln for ln in before_snippet.splitlines() if ln.strip()]
     after_lines = after_snippet.splitlines()
 
-    # Tier 2: Consecutive stripped-line match
+    # Tier 2: Consecutive stripped-line match (ignoring blank lines and leading indentation differences)
     if before_lines:
         n_b = len(before_lines)
         for idx in range(len(cur_lines)):
-            # Try matching a window of lines whose stripped non-empty lines equal before_lines
             window_end = idx
             matched_count = 0
             while window_end < len(cur_lines) and matched_count < n_b:
@@ -102,51 +141,32 @@ def _fuzzy_replace_snippet(
                 else:
                     break
             if matched_count == n_b:
-                # Determine base indentation of first matched line in current_content
                 orig_first = cur_lines[idx]
                 base_indent = orig_first[: len(orig_first) - len(orig_first.lstrip())]
-                first_after_nonempty = next((ln for ln in after_lines if ln.strip()), "")
-                after_base_indent = first_after_nonempty[
-                    : len(first_after_nonempty) - len(first_after_nonempty.lstrip())
-                ]
-                reindented_after: list[str] = []
-                for aln in after_lines:
-                    if not aln.strip():
-                        reindented_after.append("")
-                    elif not after_base_indent and base_indent:
-                        reindented_after.append(base_indent + aln)
-                    else:
-                        reindented_after.append(aln)
+                reindented_after = _reindent_after_lines(after_lines, base_indent)
                 new_lines = cur_lines[:idx] + reindented_after + cur_lines[window_end:]
-                return "\n".join(new_lines) + ("\n" if current_content.endswith("\n") else "")
+                cand_text = "\n".join(new_lines) + ("\n" if current_content.endswith("\n") else "")
+                if _is_valid_syntax_after_patch(file_path, current_content, cand_text):
+                    return cand_text
 
-    # Tier 3: Line-number range fallback when start_line is provided by the scanner
-    if start_line is not None and 1 <= start_line <= len(cur_lines) and after_lines:
-        s_idx = max(0, start_line - 1)
-        e_idx = min(len(cur_lines), (end_line if end_line and end_line >= start_line else start_line))
-        orig_line = cur_lines[s_idx]
-        base_indent = orig_line[: len(orig_line) - len(orig_line.lstrip())]
-        comment_prefix = (
-            "//"
-            if file_path.endswith((".c", ".cpp", ".cc", ".h", ".hpp", ".js", ".ts", ".go", ".java", ".rs"))
-            else "#"
-        )
-        remediated_block = [
-            f"{base_indent}{comment_prefix} [CodeMender {vuln_id}] Applied verified security remediation:"
-        ]
-        first_after_nonempty = next((ln for ln in after_lines if ln.strip()), "")
-        after_base_indent = first_after_nonempty[
-            : len(first_after_nonempty) - len(first_after_nonempty.lstrip())
-        ]
-        for aln in after_lines:
-            if not aln.strip():
-                remediated_block.append("")
-            elif not after_base_indent and base_indent:
-                remediated_block.append(base_indent + aln)
-            else:
-                remediated_block.append(aln)
-        new_lines = cur_lines[:s_idx] + remediated_block + cur_lines[e_idx:]
-        return "\n".join(new_lines) + ("\n" if current_content.endswith("\n") else "")
+    # Tier 3: Anchored first-and-last stripped line match near start_line (handles minor comment/whitespace omissions inside block)
+    if before_lines and start_line is not None and 1 <= start_line <= len(cur_lines) and after_lines:
+        search_start = max(0, start_line - 12)
+        search_end = min(len(cur_lines), (end_line or start_line) + 15)
+        first_target = before_lines[0].strip()
+        last_target = before_lines[-1].strip()
+        for s_idx in range(search_start, search_end):
+            if cur_lines[s_idx].strip() != first_target:
+                continue
+            for e_idx in range(s_idx, min(search_end, s_idx + len(before_lines) + 8)):
+                if cur_lines[e_idx].strip() == last_target:
+                    orig_first = cur_lines[s_idx]
+                    base_indent = orig_first[: len(orig_first) - len(orig_first.lstrip())]
+                    reindented_after = _reindent_after_lines(after_lines, base_indent)
+                    new_lines = cur_lines[:s_idx] + reindented_after + cur_lines[e_idx + 1 :]
+                    cand_text = "\n".join(new_lines) + ("\n" if current_content.endswith("\n") else "")
+                    if _is_valid_syntax_after_patch(file_path, current_content, cand_text):
+                        return cand_text
 
     return None
 
@@ -198,7 +218,7 @@ def apply_patch_to_workspace(
     )
     if fuzzy_updated is not None and fuzzy_updated != current_content:
         updated_content = fuzzy_updated
-    elif full_patched_file:
+    elif full_patched_file and _is_valid_syntax_after_patch(safe_rel, current_content, full_patched_file):
         updated_content = full_patched_file
     elif after_snippet and after_snippet in current_content:
         # Patch was already applied idempotently

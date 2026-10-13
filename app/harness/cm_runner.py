@@ -508,12 +508,29 @@ class CodeMenderRunner:
             total_candidates += len(candidates)
 
             for cand in candidates:
+                from app.harness.patch_applier import _fuzzy_replace_snippet
+
                 # Build full patched source preview for Stage 2 & Stage 3 sandbox verification
-                patched_full = (
-                    code_text.replace(cand.before_code, cand.after_code, 1)
-                    if cand.before_code in code_text
-                    else code_text
+                patched_full = _fuzzy_replace_snippet(
+                    code_text,
+                    cand.before_code,
+                    cand.after_code,
+                    start_line=cand.start_line,
+                    end_line=cand.end_line,
+                    file_path=rel_path,
                 )
+                if patched_full is None or patched_full == code_text:
+                    filtered_candidates.append(
+                        {
+                            "file_path": rel_path,
+                            "cwe_id": cand.cwe_id,
+                            "title": cand.title,
+                            "start_line": cand.start_line,
+                            "reason": f"[SANDBOX VERIFY: FILTERED] Candidate patch in {rel_path}:{cand.start_line} did not produce a clean syntax-valid diff.",
+                            "sandbox_evidence": f"[SANDBOX VERIFY: FILTERED] Candidate patch in {rel_path}:{cand.start_line} did not produce a clean syntax-valid diff.",
+                        }
+                    )
+                    continue
 
                 # Stage 2 & 3: cm verify (false positive filter) + cm fix verification
                 sandbox_executions += 1
@@ -526,7 +543,7 @@ class CodeMenderRunner:
                     sandbox_dir=sandbox_dir,
                 )
 
-                if not sandbox_res.verified or sandbox_res.is_false_positive:
+                if not sandbox_res.verified or sandbox_res.is_false_positive or not sandbox_res.remediation_verified:
                     filtered_candidates.append(
                         {
                             "file_path": rel_path,
