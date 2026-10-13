@@ -90,6 +90,12 @@ _SESSION_SNAPSHOT_KEYS = (
 )
 
 
+import os as _os
+
+_SESSION_TTL_SECONDS = int(_os.getenv("CM_SESSION_TTL_SECONDS", "43200"))  # Default: 12 hours
+
+
+
 def _sanitize_sid(session_id: str) -> str:
     return "".join(
         ch if (ch.isalnum() or ch in ("-", "_")) else "_"
@@ -97,10 +103,79 @@ def _sanitize_sid(session_id: str) -> str:
     ) or "default"
 
 
+def _cleanup_expired_local_sessions() -> None:
+    """Purges expired local session snapshots and workspaces in /tmp so container tmpfs never grows unboundedly."""
+    import shutil
+    import time
+    from pathlib import Path
+
+    now_ts = time.time()
+    sess_dir = Path("/tmp/codemender_sessions")
+    if sess_dir.exists():
+        try:
+            for p in sess_dir.glob("session_*.json"):
+                try:
+                    if (now_ts - p.stat().st_mtime) > _SESSION_TTL_SECONDS:
+                        p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    ws_root = Path("/tmp/codemender_workspaces")
+    if ws_root.exists():
+        try:
+            for d in ws_root.iterdir():
+                try:
+                    if d.is_dir() and (now_ts - d.stat().st_mtime) > _SESSION_TTL_SECONDS:
+                        shutil.rmtree(d, ignore_errors=True)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
+def _delete_session_snapshot(session_id: str) -> None:
+    """Physically deletes an expired session snapshot from both local disk (/tmp) and GCS."""
+    import os
+    import urllib.parse
+    import urllib.request
+    from pathlib import Path
+    from app.ingestion.file_manager import _get_gcs_access_token
+
+    sid = _sanitize_sid(session_id)
+    local_snap = Path(f"/tmp/codemender_sessions/session_{sid}.json")
+    try:
+        local_snap.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    if os.getenv("CM_DISABLE_LLM_NETWORK", "false").lower() != "true":
+        gcs_token = _get_gcs_access_token()
+        if gcs_token:
+            try:
+                obj_name = f"codemender-config/sessions/{sid}/session_snapshot.json"
+                encoded = urllib.parse.quote(obj_name, safe="")
+                url = f"https://storage.googleapis.com/storage/v1/b/{GCS_ARTIFACT_BUCKET}/o/{encoded}"
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {gcs_token}",
+                        "X-Goog-User-Project": GCP_PROJECT_ID,
+                    },
+                    method="DELETE",
+                )
+                with urllib.request.urlopen(req, timeout=4.0):
+                    pass
+            except Exception:
+                pass
+
+
 def _load_session_snapshot(session_id: str, state: Any) -> None:
     """Rehydrates session state from session-scoped local or GCS snapshot if in-memory state was lost across Cloud Run instances."""
     import json
     import os
+    import time
     import urllib.parse
     import urllib.request
     from pathlib import Path
@@ -109,6 +184,7 @@ def _load_session_snapshot(session_id: str, state: Any) -> None:
     if state.get("cm_workspace"):
         return
 
+    _cleanup_expired_local_sessions()
     sid = _sanitize_sid(session_id)
     snap: dict[str, Any] = {}
 
@@ -143,19 +219,26 @@ def _load_session_snapshot(session_id: str, state: Any) -> None:
                 logger.debug(f"Failed to read GCS session snapshot: {err}")
 
     if isinstance(snap, dict) and snap:
+        expires_at = int(snap.get("_cm_expires_at_epoch") or 0)
+        if expires_at > 0 and int(time.time()) > expires_at:
+            _delete_session_snapshot(sid)
+            return
         for k in _SESSION_SNAPSHOT_KEYS:
             if k in snap and snap[k] is not None and not state.get(k):
                 state[k] = snap[k]
 
 
 def _save_session_snapshot(session_id: str, state: Any) -> None:
-    """Persists session state strictly under the session's own local and GCS path."""
+    """Persists session state strictly under the session's own local and GCS path with TTL and zero plaintext secrets."""
     import json
     import os
+    import re
+    import time
     import urllib.parse
     import urllib.request
     from pathlib import Path
     from app.ingestion.file_manager import _get_gcs_access_token
+
 
     if state is None or not hasattr(state, "get"):
         return
@@ -165,13 +248,36 @@ def _save_session_snapshot(session_id: str, state: Any) -> None:
     if not snap:
         return
 
+    # Never store plaintext GitHub OAuth access_token or device_code inside session_snapshot.json
+    if isinstance(snap.get("cm_github_auth"), dict):
+        sanitized_auth = dict(snap["cm_github_auth"])
+        sanitized_auth.pop("access_token", None)
+        sanitized_auth.pop("pending_device_code", None)
+        snap["cm_github_auth"] = sanitized_auth
+
+    now_ts = int(time.time())
+    snap["_cm_saved_at_epoch"] = now_ts
+    snap["_cm_expires_at_epoch"] = now_ts + _SESSION_TTL_SECONDS
+
+    serialized_snap = json.dumps(snap, ensure_ascii=False)
+    serialized_snap = re.sub(
+        r"\b(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b",
+        "[REDACTED_GITHUB_TOKEN]",
+        serialized_snap,
+    )
+    serialized_snap = re.sub(
+        r"(?i)(cm\s+github\s+token\s+)[^\s\"'\\]+",
+        r"\1[REDACTED_GITHUB_TOKEN]",
+        serialized_snap,
+    )
+
     try:
         local_dir = Path("/tmp/codemender_sessions")
         local_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         local_snap = local_dir / f"session_{sid}.json"
         fd = os.open(str(local_snap), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with open(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(snap, ensure_ascii=False))
+            f.write(serialized_snap)
     except OSError as err:
         logger.debug(f"Failed to write local session snapshot: {err}")
 
@@ -184,7 +290,7 @@ def _save_session_snapshot(session_id: str, state: Any) -> None:
                 url = f"https://storage.googleapis.com/upload/storage/v1/b/{GCS_ARTIFACT_BUCKET}/o?uploadType=media&name={encoded}"
                 req = urllib.request.Request(
                     url,
-                    data=json.dumps(snap, ensure_ascii=False).encode("utf-8"),
+                    data=serialized_snap.encode("utf-8"),
                     headers={
                         "Authorization": f"Bearer {gcs_token}",
                         "Content-Type": "application/json; charset=utf-8",
@@ -196,6 +302,8 @@ def _save_session_snapshot(session_id: str, state: Any) -> None:
                     pass
             except Exception:
                 pass
+
+
 
 
 def _resolve_session_workspace(state: Any, session_id: str, user_id: str):

@@ -388,6 +388,38 @@ if [[ "${REGISTER_ONLY}" == "false" ]]; then
     echo "  ✓ Bucket gs://${CM_GCS_ARTIFACT_BUCKET} already exists"
   fi
 
+  echo "  -> Applying GCS Bucket Lifecycle auto-expiration policy (sessions: 1d TTL, patches: 7d TTL, ledger: permanent)..."
+  LIFECYCLE_TMP="$(mktemp /tmp/codemender_gcs_lifecycle.XXXXXX.json)"
+  cat > "${LIFECYCLE_TMP}" <<'EOF'
+{
+  "lifecycle": {
+    "rule": [
+      {
+        "action": {"type": "Delete"},
+        "condition": {
+          "age": 1,
+          "matchesPrefix": ["codemender-config/sessions/"]
+        }
+      },
+      {
+        "action": {"type": "Delete"},
+        "condition": {
+          "age": 7,
+          "matchesPrefix": ["codemender-patches/"]
+        }
+      }
+    ]
+  }
+}
+EOF
+  gcloud storage buckets update "gs://${CM_GCS_ARTIFACT_BUCKET}" \
+    --project "${PROJECT_ID}" \
+    --lifecycle-file="${LIFECYCLE_TMP}" >/dev/null 2>&1 || true
+  rm -f "${LIFECYCLE_TMP}"
+  gcloud storage rm "gs://${CM_GCS_ARTIFACT_BUCKET}/codemender-config/github_auth_state.json" >/dev/null 2>&1 || true
+  echo "  ✓ Configured GCS Lifecycle rules (sessions: 1d auto-delete, patches: 7d auto-delete, cost ledger: retained)"
+
+
   echo "  -> Ensuring Cloud Logging Cost Telemetry Metric (codemender_cost_events) exists..."
   if ! gcloud logging metrics describe codemender_cost_events --project "${PROJECT_ID}" >/dev/null 2>&1; then
     gcloud logging metrics create codemender_cost_events \

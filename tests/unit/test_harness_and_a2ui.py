@@ -678,11 +678,17 @@ def test_github_pr_routing_and_vcs_stage_auto_apply(monkeypatch) -> None:
 
 def test_multi_user_session_isolation_and_snapshot_rehydration(monkeypatch) -> None:
     """Verifies that User A's personal GitHub OAuth token and workspace snapshot in Session A
-    are strictly isolated from User B in Session B, while rehydrating seamlessly across instances for Session A."""
+    are strictly isolated from User B in Session B, encrypted with AES-256-GCM at rest,
+    protected against cross-session file copying, and automatically deleted upon TTL expiry."""
+    import json
+    import time
+    from pathlib import Path
     from app.agent import _load_session_snapshot, _save_session_snapshot
     from app.harness.github_integration import (
+        _get_session_local_auth_path,
         _load_persisted_github_state,
         _save_persisted_github_state,
+        logout_github_auth,
     )
     from app.ingestion import get_or_create_workspace, ingest_bytes_into_workspace
 
@@ -700,10 +706,18 @@ def test_multi_user_session_isolation_and_snapshot_rehydration(monkeypatch) -> N
         session_id=session_a,
     )
 
+    # Verify raw stored JSON on disk NEVER contains the plaintext token and uses AES-256-GCM (`cm_aead_v1:`)
+    auth_file_a = _get_session_local_auth_path(session_a)
+    raw_stored_text = auth_file_a.read_text(encoding="utf-8")
+    assert "gho_secret_personal_token_user_a" not in raw_stored_text
+    raw_stored_json = json.loads(raw_stored_text)
+    assert "access_token" not in raw_stored_json
+    assert str(raw_stored_json.get("encrypted_access_token", "")).startswith("cm_aead_v1:")
+
     state_a: dict[str, object] = {"_cm_session_id": session_a}
     state_b: dict[str, object] = {"_cm_session_id": session_b}
 
-    # User A resolves their token in Session A
+    # User A resolves and decrypts their token in Session A
     loaded_a = _load_persisted_github_state(state=state_a)
     assert loaded_a.get("access_token") == "gho_secret_personal_token_user_a"
 
@@ -711,12 +725,24 @@ def test_multi_user_session_isolation_and_snapshot_rehydration(monkeypatch) -> N
     assert _load_persisted_github_state(state=state_b) == {}
     assert _load_persisted_github_state(session_id=session_b) == {}
 
+    # Even if an attacker copies Session A's encrypted auth file to Session B's path,
+    # Session B's AAD & derived key will reject decryption and physically delete the tampered file!
+    auth_file_b = _get_session_local_auth_path(session_b)
+    auth_file_b.write_text(raw_stored_text, encoding="utf-8")
+    assert _load_persisted_github_state(state=state_b) == {}
+    assert not auth_file_b.exists()
+
     # 2. User A scans a repository in Session A and saves session snapshot
     ws_a = get_or_create_workspace(session_a, "user_a")
     ingest_bytes_into_workspace(ws_a, "private_repo_code.py", b"x = eval(user_input)\n")
     state_a["cm_workspace"] = ws_a.to_dict()
     state_a["cm_github_repo_context"] = {"owner": "user_a", "repo": "secret-private-repo"}
+    state_a["cm_github_auth"] = {"login": "user_a", "access_token": "gho_secret_personal_token_user_a"}
     _save_session_snapshot(session_a, state_a)
+
+    # Verify session_snapshot.json NEVER stores plaintext access_token either
+    snap_path_a = Path(f"/tmp/codemender_sessions/session_{session_a}.json")
+    assert "gho_secret_personal_token_user_a" not in snap_path_a.read_text(encoding="utf-8")
 
     # 3. Simulate Cloud Run autoscaling to a new container instance for Session A vs Session B
     new_instance_state_a: dict[str, object] = {"_cm_session_id": session_a}
@@ -733,6 +759,24 @@ def test_multi_user_session_isolation_and_snapshot_rehydration(monkeypatch) -> N
     # User B on a new instance has no snapshot from User A
     _load_session_snapshot(session_b, new_instance_state_b)
     assert "cm_workspace" not in new_instance_state_b
+
+    # 4. Verify TTL expiration automatically deletes expired token and snapshot files
+    _save_persisted_github_state(
+        {
+            "access_token": "gho_expired_token",
+            "expires_at_epoch": int(time.time()) - 10,
+        },
+        session_id=session_a,
+    )
+    assert _load_persisted_github_state(session_id=session_a) == {}
+    assert not auth_file_a.exists()
+
+    # Logout physically deletes auth file
+    _save_persisted_github_state({"access_token": "gho_temp"}, session_id=session_a)
+    assert auth_file_a.exists()
+    logout_github_auth(state=state_a)
+    assert not auth_file_a.exists()
+
 
 
 def test_conversational_context_and_natural_commands(monkeypatch) -> None:

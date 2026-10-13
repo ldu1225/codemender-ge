@@ -154,18 +154,21 @@ flowchart LR
 엔터프라이즈 환경에서는 여러 임직원이 동시에 하나의 Gemini Enterprise 에이전트를 사용하며, 각자 본인의 개인 GitHub 계정이나 프라이빗 리포지토리를 연동합니다.  
 이때 **사용자 A가 연동한 개인 GitHub 토큰이나 스캔 중인 소스코드를 다른 채팅방의 사용자 B가 볼 수 있으면 안 된다**는 보안 요구사항과, **Cloud Run이 여러 컨테이너로 오토스케일링되더라도 내 멀티턴 작업(`스캔` → `패치` → `PR 생성`)은 끊기면 안 된다**는 가용성 요구사항을 동시에 해결해야 합니다.
 
-#### 🔐 핵심 설계 원칙 3가지
+#### 🔐 핵심 보안 및 수명 주기(Lifecycle) 설계 원칙 4가지
 
 1. **OAuth App `client_id` (공용 식별자) vs 사용자별 `access_token` (완벽 분리)**
    - GitHub OAuth Device Flow에서 `client_id`는 "이 로그인 요청을 보내는 애플리케이션이 CodeMender이다"라고 알려주는 **앱 식별자**(Public Identifier)이므로 모든 사용자가 동일한 값을 사용합니다.
    - 반면 각 사용자가 브라우저(`https://github.com/login/device`)에서 본인의 GitHub 계정으로 로그인해 8자리 코드를 승인하면, GitHub은 **해당 사용자 전용 토큰**(`access_token`: `gho_...`)을 발급합니다.
-2. **`session_id` 기반 100% 물리적·논리적 격리 (`Cross-Session Leakage = 0%`)**
-   - 발급된 GitHub `access_token`, 스캔된 파일 워크스페이스(`cm_workspace`), 진단 결과(`cm_pipeline_result`), 타겟 리포지토리 컨텍스트(`cm_github_repo_context`)는 **절대 전역 변수나 공용 파일에 저장되지 않습니다.**
-   - 모든 데이터는 ADK가 부여하는 고유 대화 세션 ID(`session_id`)를 키로 하여 **세션 전용 GCS 경로**와 **세션 전용 컨테이너 파일**(`0o600` 소유자 전용 권한)에 완전히 분리 저장됩니다.
-   - 따라서 사용자 B(`session_id = sess_B`)가 아무리 `내 레포 목록`이나 `PR 만들어봐`를 실행해도 사용자 A(`session_id = sess_A`)의 토큰이나 리포지토리에는 **절대 접근할 수 없습니다.**
+2. **`session_id` 바인딩 AES-256-GCM 암호화 저장 (`Zero Plaintext Token at Rest`)**
+   - 발급된 GitHub `access_token`과 `device_code`는 로컬 디스크(`/tmp`)나 GCS 버킷에 **절대 평문(Plaintext)으로 저장되지 않습니다.**
+   - PBKDF2-HMAC-SHA256(100,000회 반복)으로 유도된 세션별 전용 키와 `codemender-session:<session_id>` 연관 인증 데이터(AAD)를 사용한 **AES-256-GCM(`cm_aead_v1:...`) 암호문**으로만 저장되며, `session_snapshot.json`에서도 토큰 필드는 완전히 제거(Strip)됩니다.
+   - 따라서 GCP 프로젝트 관리자나 개발자가 GCS 콘솔에서 `github_auth_state.json` 파일을 직접 다운로드해 열어봐도 평문 토큰을 볼 수 없으며, 설령 사용자 A의 암호화 파일을 사용자 B의 세션 경로로 복사하더라도 AAD 불일치로 복호화가 즉시 거부되고 파일이 자동 파기됩니다.
 3. **Cloud Run 오토스케일링 무중단 스냅샷 복원 (`Rehydration`)**
    - Cloud Run은 무상태(Stateless) 환경이므로 1턴(`스캔해줘`)을 처리한 컨테이너 #1과 2턴(`패치 적용` / `PR 만들어봐`)을 처리하는 컨테이너 #2가 서로 다를 수 있습니다.
-   - CodeMender는 매 턴이 시작될 때(`before_agent_callback`) 현재 `session_id`의 스냅샷을 GCS에서 즉시 복원(Rehydrate)하고, 턴이 끝날 때(`finally` 블록) 변경된 상태를 다시 해당 `session_id` 전용 GCS 경로에 저장합니다.
+   - CodeMender는 매 턴이 시작될 때 현재 `session_id`의 스냅샷을 GCS에서 즉시 복원(Rehydrate)하고, 턴이 끝날 때 변경된 상태를 같은 `session_id` 경로에 덮어쓰기(Overwrite)합니다.
+4. **무한 증식 원천 차단 — 애플리케이션 TTL(12시간) + GCS 버킷 Lifecycle 자동 삭제**
+   - **애플리케이션 레벨 TTL & 즉시 물리 삭제**: 모든 세션 스냅샷과 암호화 토큰에는 만료 시각(`expires_at_epoch`, 기본 12시간)이 부여됩니다. 만료된 파일이나 `깃허브 연동 해제` 요청 시 빈 값을 덮어쓰는 것이 아니라 로컬 파일(`unlink`)과 GCS 객체(`HTTP DELETE`)를 **물리적으로 즉시 삭제**합니다. 또한 컨테이너 `/tmp` 내 만료된 세션/워크스페이스 디렉터리도 자동 청소됩니다.
+   - **GCS Bucket Lifecycle 자동 청소**: 배포 스크립트([`scripts/deploy_and_register_ge.sh`](scripts/deploy_and_register_ge.sh))가 버킷에 수명 주기 규칙을 자동 설정하여, `codemender-config/sessions/` 하위 객체는 **생성 1일 후**, `codemender-patches/` 하위 패치 아티팩트는 **생성 7일 후 GCP가 자동으로 영구 삭제**합니다. (단, 비용 정산 원장인 `codemender-ledger/`는 영구 보존됩니다.)
 
 ```mermaid
 flowchart TB
@@ -175,38 +178,39 @@ flowchart TB
     end
 
     subgraph CloudRunPool["☁️ Cloud Run 오토스케일링 컨테이너 풀 (Stateless Instances)"]
-        Inst1["📦 Cloud Run Instance #1<br/>• /tmp/codemender_sessions/session_sess_A.json (0600)<br/>• /tmp/codemender_github_auth_sessions/github_auth_sess_A.json"]
-        Inst2["📦 Cloud Run Instance #2<br/>• /tmp/codemender_sessions/session_sess_B.json (0600)<br/>• /tmp/codemender_github_auth_sessions/github_auth_sess_B.json"]
+        Inst1["📦 Cloud Run Instance #1<br/>• /tmp/codemender_sessions/session_sess_A.json (0600, TTL 12h)<br/>• /tmp/codemender_github_auth_sessions/github_auth_sess_A.json (AES-256-GCM)"]
+        Inst2["📦 Cloud Run Instance #2<br/>• /tmp/codemender_sessions/session_sess_B.json (0600, TTL 12h)<br/>• /tmp/codemender_github_auth_sessions/github_auth_sess_B.json (AES-256-GCM)"]
     end
 
     subgraph GCSBucket["🪣 GCS 세션 격리 스토리지 (gs://PROJECT-a2a-bucket)"]
-        subgraph ScopeA["🔒 사용자 A 전용 격리 공간 (sess_A)"]
-            GCSA_Snap["📄 sessions/sess_A/session_snapshot.json<br/>(스캔된 코드 + 3-Stage 진단 결과 + 타겟 리포)"]
-            GCSA_Auth["🔑 sessions/sess_A/github_auth_state.json<br/>(@alice-dev 전용 OAuth access_token)"]
+        subgraph ScopeA["🔒 사용자 A 전용 격리 공간 (sess_A — Lifecycle 1일 후 자동 삭제)"]
+            GCSA_Snap["📄 sessions/sess_A/session_snapshot.json<br/>(스캔 코드 + 진단 결과 + 대화 맥락 / 토큰 제외)"]
+            GCSA_Auth["🔑 sessions/sess_A/github_auth_state.json<br/>(AES-256-GCM 암호화 토큰 cm_aead_v1:... + AAD: sess_A)"]
         end
 
-        subgraph ScopeB["🔒 사용자 B 전용 격리 공간 (sess_B)"]
-            GCSB_Snap["📄 sessions/sess_B/session_snapshot.json<br/>(스캔된 코드 + 3-Stage 진단 결과 + 타겟 리포)"]
-            GCSB_Auth["🔑 sessions/sess_B/github_auth_state.json<br/>(@bob-sec 전용 OAuth access_token)"]
+        subgraph ScopeB["🔒 사용자 B 전용 격리 공간 (sess_B — Lifecycle 1일 후 자동 삭제)"]
+            GCSB_Snap["📄 sessions/sess_B/session_snapshot.json<br/>(스캔 코드 + 진단 결과 + 대화 맥락 / 토큰 제외)"]
+            GCSB_Auth["🔑 sessions/sess_B/github_auth_state.json<br/>(AES-256-GCM 암호화 토큰 cm_aead_v1:... + AAD: sess_B)"]
         end
     end
 
     UA <-->|"Turn 1~N 라우팅"| Inst1
     UB <-->|"Turn 1~N 라우팅"| Inst2
 
-    Inst1 <-->|"매 턴 시작 시 복원 / 종료 시 저장<br/>(오직 sess_A 경로만 접근)"| ScopeA
-    Inst2 <-->|"매 턴 시작 시 복원 / 종료 시 저장<br/>(오직 sess_B 경로만 접근)"| ScopeB
-    Inst2 -.->|"컨테이너 #1 → #2 변경 시에도<br/>sess_A 스냅샷 무중단 복원"| ScopeA
+    Inst1 <-->|"매 턴 복원/덮어쓰기 (AAD: sess_A 검증)"| ScopeA
+    Inst2 <-->|"매 턴 복원/덮어쓰기 (AAD: sess_B 검증)"| ScopeB
+    Inst2 -.->|"컨테이너 변경 시에도 sess_A 복원"| ScopeA
 ```
 
-#### 📊 멀티유저 세션 격리 저장소 매핑표
+#### 📊 멀티유저 세션 격리 · 암호화 · 자동 삭제 매핑표
 
-| 데이터 항목 | 컨테이너 로컬 캐시 경로 (`0o600` 권한) | GCS 영구 격리 경로 (`gs://<BUCKET>/...`) | 다른 세션(`session_id`) 접근 가능 여부 |
-| :--- | :--- | :--- | :---: |
-| **GitHub OAuth 토큰** (`access_token`) | `/tmp/codemender_github_auth_sessions/github_auth_<session_id>.json` | `codemender-config/sessions/<session_id>/github_auth_state.json` | **❌ 절대 불가 (완벽 격리)** |
-| **스캔된 소스코드** (`cm_workspace`) | `/tmp/codemender_sessions/session_<session_id>.json` | `codemender-config/sessions/<session_id>/session_snapshot.json` | **❌ 절대 불가 (완벽 격리)** |
-| **3-Stage 진단 및 패치 상태** (`cm_pipeline_result`) | `/tmp/codemender_sessions/session_<session_id>.json` | `codemender-config/sessions/<session_id>/session_snapshot.json` | **❌ 절대 불가 (완벽 격리)** |
-| **타겟 GitHub 레포 컨텍스트** (`owner/repo`) | `/tmp/codemender_sessions/session_<session_id>.json` | `codemender-config/sessions/<session_id>/session_snapshot.json` | **❌ 절대 불가 (완벽 격리)** |
+| 데이터 항목 | 컨테이너 로컬 캐시 경로 (`0o600` 권한) | GCS 격리 경로 (`gs://<BUCKET>/...`) | 저장 형태 (암호화 여부) | 자동 삭제 주기 (TTL / Lifecycle) |
+| :--- | :--- | :--- | :---: | :---: |
+| **GitHub OAuth 토큰** (`encrypted_access_token`) | `/tmp/codemender_github_auth_sessions/github_auth_<session_id>.json` | `codemender-config/sessions/<session_id>/github_auth_state.json` | **🔐 AES-256-GCM 암호화 (`cm_aead_v1:`)** | **12시간 TTL (GCS Lifecycle 1일)** |
+| **스캔된 소스코드 & 맥락** (`cm_workspace`) | `/tmp/codemender_sessions/session_<session_id>.json` | `codemender-config/sessions/<session_id>/session_snapshot.json` | 토큰 제거된 세션 JSON | **12시간 TTL (GCS Lifecycle 1일)** |
+| **패치 완료 다운로드 파일** (`patched_*`) | `/tmp/codemender_workspaces/<session_id>/` | `codemender-patches/<session_id>/` | 패치 아티팩트 | **GCS Lifecycle 7일 후 자동 삭제** |
+| **온디맨드 비용 정산 원장** (`ledger`) | `/tmp/codemender_cost_ledger.json` | `codemender-ledger/cost_ledger.json` | 비용/토큰 집계 메타데이터 | **♾️ 영구 보존 (비용 감사 추적용)** |
+
 
 ---
 

@@ -39,6 +39,9 @@ from app.ingestion.file_manager import (
 
 logger = logging.getLogger(__name__)
 
+import hashlib
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 # Official public GitHub CLI (`gh`) OAuth App Client ID for RFC 8628 Device Flow when no custom OAuth App is provided
 GITHUB_OAUTH_CLIENT_ID = (
     os.getenv("GITHUB_OAUTH_CLIENT_ID", "").strip()
@@ -50,6 +53,9 @@ LOCAL_GITHUB_AUTH_DIR = Path(
     os.getenv("CM_GITHUB_AUTH_DIR", "/tmp/codemender_github_auth_sessions")
 )
 GCS_GITHUB_AUTH_PREFIX = "codemender-config/sessions"
+GITHUB_TOKEN_TTL_SECONDS = int(
+    os.getenv("CM_GITHUB_TOKEN_TTL_SECONDS", "43200")
+)  # Default: 12 hours
 
 
 def _resolve_session_id(state: Any = None, session_id: str | None = None) -> str:
@@ -68,6 +74,106 @@ def _resolve_session_id(state: Any = None, session_id: str | None = None) -> str
     return cleaned or "ephemeral_local"
 
 
+def _derive_session_aead_key(session_id: str) -> bytes:
+    """Derives a 256-bit AES-GCM key bound to the GCP project and specific user session_id."""
+    master_secret = (
+        os.getenv("CM_TOKEN_ENCRYPTION_KEY", "").strip()
+        or f"codemender-ge-aead-v1:{GCS_PROJECT_ID}:{GCS_ARTIFACT_BUCKET}:{GITHUB_OAUTH_CLIENT_ID}"
+    )
+    salt = f"cm-session-salt-v1:{GCS_PROJECT_ID}:{session_id}".encode("utf-8")
+    return hashlib.pbkdf2_hmac(
+        "sha256", master_secret.encode("utf-8"), salt, 100_000, dklen=32
+    )
+
+
+def _encrypt_session_secret(plaintext: str, session_id: str) -> str:
+    """Encrypts a sensitive token using AES-256-GCM with session-bound Associated Authenticated Data (AAD)."""
+    if not plaintext:
+        return ""
+    if plaintext.startswith("cm_aead_v1:"):
+        return plaintext
+    key = _derive_session_aead_key(session_id)
+    nonce = os.urandom(12)
+    aad = f"codemender-session:{session_id}".encode("utf-8")
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), aad)
+    encoded = base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii")
+    return f"cm_aead_v1:{encoded}"
+
+
+def _decrypt_session_secret(encrypted_value: str, session_id: str) -> str:
+    """Decrypts an AES-256-GCM encrypted token only if the caller's session_id matches the AAD."""
+    if not encrypted_value:
+        return ""
+    if not encrypted_value.startswith("cm_aead_v1:"):
+        return ""
+    try:
+        raw = base64.urlsafe_b64decode(
+            encrypted_value[len("cm_aead_v1:") :].encode("ascii")
+        )
+        if len(raw) < 28:
+            return ""
+        nonce, ciphertext = raw[:12], raw[12:]
+        key = _derive_session_aead_key(session_id)
+        aad = f"codemender-session:{session_id}".encode("utf-8")
+        plaintext_bytes = AESGCM(key).decrypt(nonce, ciphertext, aad)
+        return plaintext_bytes.decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _pack_auth_state_for_storage(
+    data: dict[str, Any], session_id: str
+) -> dict[str, Any]:
+    """Strips plaintext tokens and replaces them with session-bound AES-256-GCM ciphertext and TTL metadata."""
+    stored = dict(data)
+    now_ts = int(time.time())
+    stored["saved_at_epoch"] = now_ts
+    stored["expires_at_epoch"] = int(
+        stored.get("expires_at_epoch") or (now_ts + GITHUB_TOKEN_TTL_SECONDS)
+    )
+    raw_token = str(stored.pop("access_token", "") or "").strip()
+    if raw_token:
+        stored["encrypted_access_token"] = _encrypt_session_secret(
+            raw_token, session_id
+        )
+    raw_dc = str(stored.pop("pending_device_code", "") or "").strip()
+    if raw_dc:
+        stored["encrypted_device_code"] = _encrypt_session_secret(
+            raw_dc, session_id
+        )
+    return stored
+
+
+def _unpack_auth_state_from_storage(
+    stored: dict[str, Any], session_id: str
+) -> dict[str, Any] | None:
+    """Verifies TTL and decrypts session-bound AES-256-GCM tokens into memory. Returns None if expired or tampered."""
+    if not isinstance(stored, dict) or not stored:
+        return None
+    now_ts = int(time.time())
+    expires_at = int(stored.get("expires_at_epoch") or 0)
+    if expires_at > 0 and now_ts > expires_at:
+        return None
+
+    unpacked = dict(stored)
+    enc_tok = str(unpacked.pop("encrypted_access_token", "") or "").strip()
+    if enc_tok:
+        dec_tok = _decrypt_session_secret(enc_tok, session_id)
+        if not dec_tok:
+            return None
+        unpacked["access_token"] = dec_tok
+    elif "access_token" in unpacked:
+        # Reject unencrypted legacy plaintext tokens in storage
+        unpacked.pop("access_token", None)
+
+    enc_dc = str(unpacked.pop("encrypted_device_code", "") or "").strip()
+    if enc_dc:
+        dec_dc = _decrypt_session_secret(enc_dc, session_id)
+        if dec_dc:
+            unpacked["pending_device_code"] = dec_dc
+    return unpacked
+
+
 def _get_session_local_auth_path(session_id: str) -> Path:
     return LOCAL_GITHUB_AUTH_DIR / f"github_auth_{session_id}.json"
 
@@ -76,15 +182,67 @@ def _get_session_gcs_auth_object(session_id: str) -> str:
     return f"{GCS_GITHUB_AUTH_PREFIX}/{session_id}/github_auth_state.json"
 
 
+def _cleanup_expired_local_auth_files() -> None:
+    """Purges expired local auth files in /tmp so container tmpfs never accumulates stale files."""
+    if not LOCAL_GITHUB_AUTH_DIR.exists():
+        return
+    now_ts = time.time()
+    try:
+        for path in LOCAL_GITHUB_AUTH_DIR.glob("github_auth_*.json"):
+            try:
+                if (now_ts - path.stat().st_mtime) > GITHUB_TOKEN_TTL_SECONDS:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _delete_persisted_github_state(
+    state: Any = None, session_id: str | None = None
+) -> None:
+    """Physically deletes the session's GitHub auth file from both local disk (/tmp) and GCS."""
+    sid = _resolve_session_id(state, session_id)
+    local_path = _get_session_local_auth_path(sid)
+    try:
+        local_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    if os.getenv("CM_DISABLE_LLM_NETWORK", "false").lower() != "true":
+        gcs_token = _get_gcs_access_token()
+        if gcs_token:
+            try:
+                gcs_obj = _get_session_gcs_auth_object(sid)
+                encoded = urllib.parse.quote(gcs_obj, safe="")
+                url = (
+                    f"https://storage.googleapis.com/storage/v1/b/"
+                    f"{GCS_ARTIFACT_BUCKET}/o/{encoded}"
+                )
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {gcs_token}",
+                        "X-Goog-User-Project": GCS_PROJECT_ID,
+                    },
+                    method="DELETE",
+                )
+                with urllib.request.urlopen(req, timeout=4.0):
+                    pass
+            except Exception:
+                pass
+
+
 def _load_persisted_github_state(
     state: Any = None, session_id: str | None = None
 ) -> dict[str, Any]:
-    """Loads persisted GitHub auth state strictly scoped to the current user session."""
+    """Loads and decrypts persisted GitHub auth state strictly scoped to the current user session."""
     # 1. Check environment variable override first (only if explicitly configured)
     env_token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
     if env_token and env_token.strip():
         return {"access_token": env_token.strip(), "source": "env"}
 
+    _cleanup_expired_local_auth_files()
     sid = _resolve_session_id(state, session_id)
     if sid == "ephemeral_local" and state is not None and hasattr(state, "get"):
         sess_auth = state.get("cm_github_auth")
@@ -112,7 +270,13 @@ def _load_persisted_github_state(
                 with urllib.request.urlopen(req, timeout=4.0) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     if isinstance(data, dict) and data:
-                        return data
+                        unpacked = _unpack_auth_state_from_storage(data, sid)
+                        if unpacked is None:
+                            _delete_persisted_github_state(
+                                state=state, session_id=sid
+                            )
+                            return {}
+                        return unpacked
             except Exception:
                 pass
 
@@ -121,8 +285,12 @@ def _load_persisted_github_state(
     if local_path.exists():
         try:
             data = json.loads(local_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data
+            if isinstance(data, dict) and data:
+                unpacked = _unpack_auth_state_from_storage(data, sid)
+                if unpacked is None:
+                    _delete_persisted_github_state(state=state, session_id=sid)
+                    return {}
+                return unpacked
         except Exception:
             pass
     return {}
@@ -131,15 +299,21 @@ def _load_persisted_github_state(
 def _save_persisted_github_state(
     data: dict[str, Any], state: Any = None, session_id: str | None = None
 ) -> None:
-    """Saves GitHub auth state strictly under the current session's local file (`0o600`) and GCS path."""
+    """Encrypts sensitive tokens with AES-256-GCM and saves under the current session's local file (`0o600`) and GCS path."""
     sid = _resolve_session_id(state, session_id)
+    if not data:
+        _delete_persisted_github_state(state=state, session_id=sid)
+        return
+
+    packed = _pack_auth_state_for_storage(data, sid)
     local_path = _get_session_local_auth_path(sid)
     try:
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        local_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(
+            str(local_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
         )
-        os.chmod(local_path, 0o600)
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(packed, indent=2, ensure_ascii=False))
     except Exception:
         pass
 
@@ -155,7 +329,7 @@ def _save_persisted_github_state(
                 )
                 req = urllib.request.Request(
                     url,
-                    data=json.dumps(data, ensure_ascii=False).encode("utf-8"),
+                    data=json.dumps(packed, ensure_ascii=False).encode("utf-8"),
                     headers={
                         "Authorization": f"Bearer {gcs_token}",
                         "Content-Type": "application/json; charset=utf-8",
@@ -167,6 +341,7 @@ def _save_persisted_github_state(
                     pass
             except Exception:
                 pass
+
 
 
 def _github_api_request(
