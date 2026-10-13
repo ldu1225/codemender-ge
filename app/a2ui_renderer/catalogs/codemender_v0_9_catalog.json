@@ -1,0 +1,159 @@
+{
+  "catalogId": "https://codemender.ge/specification/v0_9/catalogs/codemender_material/catalog.json",
+  "title": "CodeMender Material Security Catalog (A2UI v0.9)",
+  "description": "Extends A2UI v0.9 Basic Catalog with MaterialCard, MaterialBadge, CodeDiff, and MaterialButton for Gemini Enterprise interactive vulnerability remediation.",
+  "customComponents": {
+    "MaterialCard": {
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentCommon"
+        },
+        {
+          "$ref": "#/$defs/CatalogComponentCommon"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "component": {
+              "const": "MaterialCard"
+            },
+            "title": {
+              "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/DynamicString"
+            },
+            "subtitle": {
+              "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/DynamicString"
+            },
+            "elevation": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 5,
+              "default": 2
+            },
+            "status": {
+              "type": "string",
+              "enum": ["PENDING_APPROVAL", "APPLIED", "REJECTED", "INFO"]
+            },
+            "children": {
+              "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ChildList"
+            }
+          },
+          "required": ["component", "title", "children"]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "MaterialBadge": {
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentCommon"
+        },
+        {
+          "$ref": "#/$defs/CatalogComponentCommon"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "component": {
+              "const": "MaterialBadge"
+            },
+            "label": {
+              "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/DynamicString"
+            },
+            "severity": {
+              "type": "string",
+              "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "VERIFIED", "PATCHED", "INFO"]
+            },
+            "cweId": {
+              "type": "string"
+            },
+            "owaspCategory": {
+              "type": "string"
+            }
+          },
+          "required": ["component", "label", "severity"]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CodeDiff": {
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentCommon"
+        },
+        {
+          "$ref": "#/$defs/CatalogComponentCommon"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "component": {
+              "const": "CodeDiff"
+            },
+            "filePath": {
+              "type": "string"
+            },
+            "language": {
+              "type": "string"
+            },
+            "startLine": {
+              "type": "integer"
+            },
+            "endLine": {
+              "type": "integer"
+            },
+            "beforeCode": {
+              "type": "string"
+            },
+            "afterCode": {
+              "type": "string"
+            },
+            "unifiedDiff": {
+              "type": "string"
+            }
+          },
+          "required": ["component", "filePath", "beforeCode", "afterCode", "unifiedDiff"]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "MaterialButton": {
+      "type": "object",
+      "allOf": [
+        {
+          "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/ComponentCommon"
+        },
+        {
+          "$ref": "#/$defs/CatalogComponentCommon"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "component": {
+              "const": "MaterialButton"
+            },
+            "label": {
+              "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/DynamicString"
+            },
+            "variant": {
+              "type": "string",
+              "enum": ["primary", "tonal", "outlined", "danger", "default"],
+              "default": "primary"
+            },
+            "disabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "action": {
+              "$ref": "https://a2ui.org/specification/v0_9/common_types.json#/$defs/Action"
+            }
+          },
+          "required": ["component", "label", "action"]
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

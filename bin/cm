@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""CodeMender (`cm` v0.12.0) CLI entrypoint supporting the full 12-command suite."""
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+import uuid
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from app.config import CODEMENDER_MODEL
+from app.harness.cm_commands import (
+    build_html_security_report,
+    build_json_security_report,
+    execute_cm_command,
+    parse_cm_chat_command,
+)
+from app.harness.cm_runner import CodeMenderRunner
+from app.ingestion.file_manager import (
+    WorkspaceContext,
+    WorkspaceSecurityError,
+    cleanup_workspace,
+    get_or_create_workspace,
+    ingest_bytes_into_workspace,
+)
+
+
+def _populate_workspace_from_dir(target_dir: str) -> WorkspaceContext:
+    ws = get_or_create_workspace(session_id=f"cli-{uuid.uuid4().hex[:8]}")
+    target_real = os.path.realpath(target_dir)
+    if os.path.isfile(target_real):
+        with open(target_real, "rb") as fh:
+            ingest_bytes_into_workspace(ws, os.path.basename(target_real), fh.read())
+        return ws
+
+    for root, _, filenames in os.walk(target_real):
+        for fname in sorted(filenames):
+            full_path = os.path.join(root, fname)
+            try:
+                with open(full_path, "rb") as fh:
+                    ingest_bytes_into_workspace(ws, fname, fh.read())
+            except (OSError, WorkspaceSecurityError):
+                continue
+    return ws
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="cm",
+        description="CodeMender (cm v0.12.0) Security CLI — init, find, verify, fix, report, triage, vcs, build, stats, sessions, artifacts, models",
+    )
+    parser.add_argument(
+        "subcommand",
+        choices=[
+            "init",
+            "find",
+            "verify",
+            "fix",
+            "report",
+            "triage",
+            "vcs",
+            "build",
+            "stats",
+            "sessions",
+            "artifacts",
+            "models",
+            "test-all-models",
+            "switch-model",
+            "help",
+        ],
+        help="CodeMender subcommand",
+    )
+    parser.add_argument(
+        "workspace",
+        nargs="?",
+        default=".",
+        help="Path to source file/directory or subcommand argument (e.g. status, diff, reset, stage)",
+    )
+    parser.add_argument("--model", "-m", default=CODEMENDER_MODEL)
+    parser.add_argument(
+        "--format", "-f", default="json", choices=["json", "text", "markdown", "html"]
+    )
+    parser.add_argument("-c", "--context", default=None, help="Extra context for cm fix")
+    parser.add_argument("--revert", action="store_true", help="Revert applied patch")
+    parser.add_argument("--verify", action="store_true", help="Verify environment on init")
+
+    args, extra = parser.parse_known_args()
+    os.environ["CM_ENABLE_EXTERNAL_BINARY"] = "false"
+
+    target_dir = args.workspace if os.path.exists(args.workspace) else "."
+    ws = _populate_workspace_from_dir(target_dir)
+    try:
+        runner = CodeMenderRunner(model_name=args.model)
+        result = runner.run_pipeline(ws)
+
+        if args.subcommand in ("find", "verify", "fix") and args.format == "json" and not args.revert and not args.context:
+            payload = result.to_dict()
+            payload["subcommand"] = args.subcommand
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return 0
+
+        if args.subcommand == "report" and args.format == "json":
+            print(json.dumps(build_json_security_report(result), indent=2, ensure_ascii=False))
+            return 0
+
+        if args.subcommand == "report" and args.format == "html":
+            print(build_html_security_report(result))
+            return 0
+
+        state = {
+            "cm_workspace": ws.to_dict(),
+            "cm_pipeline_result": result.to_dict(),
+            "cm_active_model": args.model,
+        }
+        raw_cmd = f"cm {args.subcommand}"
+        if args.workspace and not os.path.exists(args.workspace):
+            raw_cmd += f" {args.workspace}"
+        if args.revert:
+            raw_cmd += " --revert"
+        if args.context:
+            raw_cmd += f' -c "{args.context}"'
+        if args.format:
+            raw_cmd += f" -f {args.format}"
+
+        parsed = parse_cm_chat_command(raw_cmd) or {"subcommand": args.subcommand, "raw": raw_cmd}
+        out = asyncio.run(execute_cm_command(parsed, workspace=ws, state=state))
+        if out.get("markdown"):
+            print(out["markdown"])
+        else:
+            print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+        return 0
+    finally:
+        cleanup_workspace(ws)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
