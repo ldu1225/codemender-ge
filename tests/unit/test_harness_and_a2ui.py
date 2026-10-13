@@ -629,3 +629,62 @@ def test_github_pr_routing_and_vcs_stage_auto_apply(monkeypatch) -> None:
     assert '    exec(code_str, {"__builtins__": {}}, namespace)' in res.patched_content
 
 
+def test_multi_user_session_isolation_and_snapshot_rehydration(monkeypatch) -> None:
+    """Verifies that User A's personal GitHub OAuth token and workspace snapshot in Session A
+    are strictly isolated from User B in Session B, while rehydrating seamlessly across instances for Session A."""
+    from app.agent import _load_session_snapshot, _save_session_snapshot
+    from app.harness.github_integration import (
+        _load_persisted_github_state,
+        _save_persisted_github_state,
+    )
+    from app.ingestion import get_or_create_workspace, ingest_bytes_into_workspace
+
+    monkeypatch.setenv("CM_DISABLE_LLM_NETWORK", "true")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_PAT", raising=False)
+
+    session_a = "ge_chat_room_user_a_001"
+    session_b = "ge_chat_room_user_b_002"
+
+    # 1. User A authenticates their personal GitHub account in Session A
+    _save_persisted_github_state(
+        {"access_token": "gho_secret_personal_token_user_a", "token_type": "bearer"},
+        session_id=session_a,
+    )
+
+    state_a: dict[str, object] = {"_cm_session_id": session_a}
+    state_b: dict[str, object] = {"_cm_session_id": session_b}
+
+    # User A resolves their token in Session A
+    loaded_a = _load_persisted_github_state(state=state_a)
+    assert loaded_a.get("access_token") == "gho_secret_personal_token_user_a"
+
+    # User B in Session B MUST NOT receive User A's personal token
+    assert _load_persisted_github_state(state=state_b) == {}
+    assert _load_persisted_github_state(session_id=session_b) == {}
+
+    # 2. User A scans a repository in Session A and saves session snapshot
+    ws_a = get_or_create_workspace(session_a, "user_a")
+    ingest_bytes_into_workspace(ws_a, "private_repo_code.py", b"x = eval(user_input)\n")
+    state_a["cm_workspace"] = ws_a.to_dict()
+    state_a["cm_github_repo_context"] = {"owner": "user_a", "repo": "secret-private-repo"}
+    _save_session_snapshot(session_a, state_a)
+
+    # 3. Simulate Cloud Run autoscaling to a new container instance for Session A vs Session B
+    new_instance_state_a: dict[str, object] = {"_cm_session_id": session_a}
+    new_instance_state_b: dict[str, object] = {"_cm_session_id": session_b}
+
+    _load_session_snapshot(session_a, new_instance_state_a)
+    assert "cm_workspace" in new_instance_state_a
+    file_names_a = [
+        f["relative_path"] for f in new_instance_state_a["cm_workspace"]["files"]  # type: ignore[index]
+    ]
+    assert "private_repo_code.py" in file_names_a
+    assert new_instance_state_a["cm_github_repo_context"]["repo"] == "secret-private-repo"  # type: ignore[index]
+
+    # User B on a new instance has no snapshot from User A
+    _load_session_snapshot(session_b, new_instance_state_b)
+    assert "cm_workspace" not in new_instance_state_b
+
+

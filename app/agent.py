@@ -97,7 +97,128 @@ def ping_gateway_host(gateway_host: str) -> str:
 '''
 
 
+_SESSION_SNAPSHOT_KEYS = (
+    "cm_workspace",
+    "cm_pipeline_result",
+    "cm_github_repo_context",
+    "cm_github_auth",
+    "cm_command_history",
+    "cm_active_model",
+    "codemender_session_cost_ledger",
+    "_cm_session_id",
+)
+
+
+def _sanitize_sid(session_id: str) -> str:
+    return "".join(
+        ch if (ch.isalnum() or ch in ("-", "_")) else "_"
+        for ch in str(session_id or "default").strip()
+    ) or "default"
+
+
+def _load_session_snapshot(session_id: str, state: Any) -> None:
+    """Rehydrates session state from session-scoped local or GCS snapshot if in-memory state was lost across Cloud Run instances."""
+    import json
+    import os
+    import urllib.parse
+    import urllib.request
+    from pathlib import Path
+    from app.ingestion.file_manager import _get_gcs_access_token
+
+    if state.get("cm_workspace"):
+        return
+
+    sid = _sanitize_sid(session_id)
+    snap: dict[str, Any] = {}
+
+    local_snap = Path(f"/tmp/codemender_sessions/session_{sid}.json")
+    if local_snap.exists():
+        try:
+            snap = json.loads(local_snap.read_text(encoding="utf-8"))
+        except Exception:
+            snap = {}
+
+    if not snap and os.getenv("CM_DISABLE_LLM_NETWORK", "false").lower() != "true":
+        gcs_token = _get_gcs_access_token()
+        if gcs_token:
+            try:
+                obj_name = f"codemender-config/sessions/{sid}/session_snapshot.json"
+                encoded = urllib.parse.quote(obj_name, safe="")
+                url = f"https://storage.googleapis.com/storage/v1/b/{GCS_ARTIFACT_BUCKET}/o/{encoded}?alt=media"
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {gcs_token}",
+                        "X-Goog-User-Project": GCP_PROJECT_ID,
+                    },
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    loaded = json.loads(resp.read().decode("utf-8"))
+                    if isinstance(loaded, dict):
+                        snap = loaded
+            except Exception:
+                pass
+
+    if isinstance(snap, dict) and snap:
+        for k in _SESSION_SNAPSHOT_KEYS:
+            if k in snap and snap[k] is not None and not state.get(k):
+                state[k] = snap[k]
+
+
+def _save_session_snapshot(session_id: str, state: Any) -> None:
+    """Persists session state strictly under the session's own local and GCS path."""
+    import json
+    import os
+    import urllib.parse
+    import urllib.request
+    from pathlib import Path
+    from app.ingestion.file_manager import _get_gcs_access_token
+
+    if state is None or not hasattr(state, "get"):
+        return
+
+    sid = _sanitize_sid(session_id or state.get("_cm_session_id") or "default")
+    snap = {k: state.get(k) for k in _SESSION_SNAPSHOT_KEYS if state.get(k) is not None}
+    if not snap:
+        return
+
+    try:
+        local_snap = Path(f"/tmp/codemender_sessions/session_{sid}.json")
+        local_snap.parent.mkdir(parents=True, exist_ok=True)
+        local_snap.write_text(
+            json.dumps(snap, ensure_ascii=False), encoding="utf-8"
+        )
+        os.chmod(local_snap, 0o600)
+    except Exception:
+        pass
+
+    if os.getenv("CM_DISABLE_LLM_NETWORK", "false").lower() != "true":
+        gcs_token = _get_gcs_access_token()
+        if gcs_token:
+            try:
+                obj_name = f"codemender-config/sessions/{sid}/session_snapshot.json"
+                encoded = urllib.parse.quote(obj_name, safe="")
+                url = f"https://storage.googleapis.com/upload/storage/v1/b/{GCS_ARTIFACT_BUCKET}/o?uploadType=media&name={encoded}"
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(snap, ensure_ascii=False).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {gcs_token}",
+                        "Content-Type": "application/json; charset=utf-8",
+                        "X-Goog-User-Project": GCP_PROJECT_ID,
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5.0):
+                    pass
+            except Exception:
+                pass
+
+
 def _resolve_session_workspace(state: Any, session_id: str, user_id: str):
+    state["_cm_session_id"] = session_id
+    _load_session_snapshot(session_id, state)
     existing_ws = state.get("cm_workspace")
     ws = get_or_create_workspace(
         session_id=session_id,
@@ -503,6 +624,20 @@ async def codemender_before_agent_callback(
     state = callback_context.state
     inv_ctx = callback_context._invocation_context
     session_id = getattr(inv_ctx.session, "id", "default_session")
+    try:
+        return await _codemender_before_agent_callback_inner(
+            callback_context, state, inv_ctx, session_id
+        )
+    finally:
+        _save_session_snapshot(session_id, state)
+
+
+async def _codemender_before_agent_callback_inner(
+    callback_context: CallbackContext,
+    state: Any,
+    inv_ctx: Any,
+    session_id: str,
+) -> types.Content | None:
     user_id = getattr(inv_ctx, "user_id", "default_user")
 
     # 1. Negotiate catalog mode

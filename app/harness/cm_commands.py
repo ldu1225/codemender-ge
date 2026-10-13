@@ -1333,6 +1333,9 @@ async def execute_cm_command(
                             state=state,
                         )
                         if pr_res.get("status") == "ok":
+                            vcs_entries = compute_workspace_vcs_status(workspace)
+                            modified_entries = [e for e in vcs_entries if e["status"] == "MODIFIED"]
+                            files_str = ", ".join(e["file_path"] for e in (modified_entries or vcs_entries))
                             pr_url = pr_res.get("pr_url") or pr_res.get("branch_url")
                             pr_num = pr_res.get("pr_number", 0)
                             gh_pr_section = [
