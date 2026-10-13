@@ -456,6 +456,7 @@ def fetch_github_repo_files_into_workspace(
     subpath: str = "",
     branch: str = "",
     max_files: int = 8,
+    state: Any = None,
 ) -> dict[str, Any]:
     """Fetches source files from a GitHub repository (`owner/repo`) and mounts them into the CodeMender workspace."""
     clean_repo = repo_full_name.strip().removeprefix("https://github.com/").strip("/")
@@ -600,10 +601,10 @@ def fetch_github_repo_files_into_workspace(
         "file_github_paths": file_github_paths,
     }
     try:
-        persisted = _load_persisted_github_state()
+        persisted = _load_persisted_github_state(state=state, session_id=workspace.session_id)
         if isinstance(persisted, dict):
             persisted["last_github_repo_context"] = repo_ctx
-            _save_persisted_github_state(persisted)
+            _save_persisted_github_state(persisted, state=state, session_id=workspace.session_id)
     except Exception:
         pass
     return repo_ctx
@@ -625,7 +626,7 @@ def create_github_pr_or_push_patches(
         if (state is not None and hasattr(state, "get"))
         else None
     )
-    persisted = _load_persisted_github_state()
+    persisted = _load_persisted_github_state(state=state, session_id=workspace.session_id)
     if not isinstance(gh_meta, dict) or not gh_meta.get("repo"):
         persisted_ctx = (
             persisted.get("last_github_repo_context")

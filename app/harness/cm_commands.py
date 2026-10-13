@@ -288,25 +288,27 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
             "raw": first_line,
         }
 
-    # 2. Natural-language Korean / English command mapping
-    if any(
-        k in lower
-        for k in ("cm 명령어", "명령어 목록", "전체 기능", "무슨 기능", "기능 목록")
-    ):
+    # 2. Natural-language Korean / English command mapping (space-insensitive for Korean phrasing)
+    no_space = re.sub(r"\s+", "", lower)
+
+    def _matches(*keywords: str) -> bool:
+        for k in keywords:
+            k_low = k.lower()
+            k_ns = re.sub(r"\s+", "", k_low)
+            if k_low in lower or (k_ns and k_ns in no_space):
+                return True
+        return False
+
+    if _matches("cm 명령어", "명령어 목록", "전체 기능", "무슨 기능", "기능 목록"):
         return {"subcommand": "help", "raw": first_line}
 
-    if any(k in lower for k in ("워크스페이스 초기화", "cm 초기화", "설정 초기화")):
+    if _matches("워크스페이스 초기화", "cm 초기화", "설정 초기화"):
         return {"subcommand": "init", "verify": True, "raw": first_line}
 
-    if any(
-        k in lower
-        for k in ("트리아지", "triage", "우선순위 분류", "보안 게이트", "security gate")
-    ):
+    if _matches("트리아지", "triage", "우선순위 분류", "보안 게이트", "security gate"):
         return {"subcommand": "triage", "raw": first_line}
 
-    if any(
-        k in lower for k in ("패치 롤백", "패치 취소", "패치 원복", "원복해", "롤백해", "revert")
-    ):
+    if _matches("패치 롤백", "패치 취소", "패치 원복", "원복해", "롤백해", "revert"):
         vid_match = re.search(r"(CM-[A-Z0-9-]+-\d+)", first_line, re.IGNORECASE)
         return {
             "subcommand": "fix",
@@ -315,92 +317,74 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
             "raw": first_line,
         }
 
-    if any(k in lower for k in ("json 리포트", "json 보고서", "report json")):
+    if _matches("json 리포트", "json 보고서", "report json"):
         return {"subcommand": "report", "format": "json", "raw": first_line}
 
-    if any(k in lower for k in ("html 리포트", "html 보고서", "report html")):
+    if _matches("html 리포트", "html 보고서", "report html"):
         return {"subcommand": "report", "format": "html", "raw": first_line}
 
-    if any(k in lower for k in ("리포트 조회", "보고서 출력", "결과 요약표")):
+    if _matches("리포트 조회", "보고서 출력", "결과 요약표"):
         return {"subcommand": "report", "format": "text", "raw": first_line}
 
-    if any(k in lower for k in ("vcs diff", "git diff", "변경사항 비교", "전체 diff")):
+    if _matches("vcs diff", "git diff", "변경사항 비교", "전체 diff"):
         return {"subcommand": "vcs", "positional": ["diff"], "raw": first_line}
 
-    if any(k in lower for k in ("vcs status", "git status", "파일 상태", "수정 상태")):
+    if _matches("vcs status", "git status", "파일 상태", "수정 상태"):
         return {"subcommand": "vcs", "positional": ["status"], "raw": first_line}
 
-    if any(k in lower for k in ("vcs reset", "git reset", "원본으로 초기화")):
+    if _matches("vcs reset", "git reset", "원본으로 초기화"):
         return {"subcommand": "vcs", "positional": ["reset"], "raw": first_line}
 
-    if any(
-        k in lower
-        for k in ("vcs stage", "git stage", "커밋 메시지")
-    ):
+    if _matches("vcs stage", "git stage", "커밋 메시지"):
         return {"subcommand": "vcs", "positional": ["stage"], "raw": first_line}
 
-    if any(k in lower for k in ("빌드 검증", "컴파일 검증", "구문 검사", "빌드 테스트")):
+    if _matches("빌드 검증", "컴파일 검증", "구문 검사", "빌드 테스트"):
         return {"subcommand": "build", "raw": first_line}
 
-    if any(
-        k in lower
-        for k in (
-            "비용",
-            "요금",
-            "청구",
-            "정산",
-            "과금",
-            "얼마 나왔",
-            "얼마나 나왔",
-            "얼마야",
-            "얼마인지",
-            "얼마나 들었",
-            "토큰 사용량",
-            "세션 통계",
-            "통계 조회",
-            "세션별",
-            "트랜잭션별",
-            "트랜잭션마다",
-            "세션마다",
-            "로그 비용",
-            "로깅 비용",
-            "클라우드 로깅",
-            "cloud logging",
-            "stats",
-            "cost",
-            "billing",
-            "logs",
-        )
-    ):
+    if _matches(
+        "비용",
+        "요금",
+        "청구",
+        "정산",
+        "과금",
+        "얼마 나왔",
+        "얼마나 나왔",
+        "얼마야",
+        "얼마인지",
+        "얼마나 들었",
+        "토큰 사용량",
+        "세션 통계",
+        "통계 조회",
+        "세션별",
+        "트랜잭션별",
+        "트랜잭션마다",
+        "세션마다",
+        "로그 비용",
+        "로깅 비용",
+        "클라우드 로깅",
+        "cloud logging",
+    ) or any(k in lower.split() for k in ("stats", "cost", "billing", "logs")):
         return {"subcommand": "cost", "raw": first_line}
 
-    if any(k in lower for k in ("세션 이력", "명령 이력", "sessions")):
+    if _matches("세션 이력", "명령 이력") or "sessions" in lower.split():
         return {"subcommand": "sessions", "raw": first_line}
 
-    if any(
-        k in lower
-        for k in (
-            "아티팩트 목록",
-            "생성된 파일",
-            "다운로드",
-            "download",
-            "어디에 저장",
-            "어디에저장",
-            "어디있",
-            "어디 있",
-            "저장 위치",
-            "저장된",
-            "수정한 파일",
-            "수정된 파일",
-            "artifacts",
-        )
+    if _matches(
+        "아티팩트 목록",
+        "생성된 파일",
+        "다운로드",
+        "download",
+        "어디에 저장",
+        "어디 있",
+        "저장 위치",
+        "저장된",
+        "수정한 파일",
+        "수정된 파일",
+        "artifacts",
     ):
         return {"subcommand": "artifacts", "raw": first_line}
 
-    if any(
-        k in lower
-        for k in ("모델 비교", "모델 목록", "모델 테스트", "test-all-models", "switch-model")
-    ):
+    if _matches("모델 비교", "모델 목록", "모델 테스트", "test-all-models", "switch-model"):
         for m_name in SUPPORTED_CM_MODELS:
             if m_name in lower:
                 return {
@@ -422,79 +406,71 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
     gh_repo_match = re.search(
         r"(?:https://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", first_line
     )
-    if any(
-        k in lower
-        for k in (
-            "깃허브 로그아웃",
-            "깃허브 연결 해제",
-            "깃허브 연동 해제",
-            "github logout",
-        )
+    if _matches(
+        "깃허브 로그아웃",
+        "깃허브 연결 해제",
+        "깃허브 연동 해제",
+        "로그아웃",
+        "github logout",
     ):
         return {"subcommand": "github", "positional": ["logout"], "raw": first_line}
 
-    if any(
-        k in lower
-        for k in (
-            "깃허브 인증 완료",
-            "깃허브 인증 확인",
-            "인증 완료",
-            "인증 확인",
-            "인증했어",
-            "깃허브 상태",
-            "내 깃허브 계정",
-            "github status",
-            "github verify",
-        )
+    if _matches(
+        "깃허브 인증 완료",
+        "깃허브 인증 확인",
+        "인증 완료",
+        "인증 확인",
+        "인증했어",
+        "인증됐어",
+        "승인했어",
+        "승인 완료",
+        "깃허브 상태",
+        "내 깃허브 계정",
+        "github status",
+        "github verify",
     ):
         return {"subcommand": "github", "positional": ["status"], "raw": first_line}
 
-    if any(
-        k in lower
-        for k in (
-            "깃허브 레포",
-            "깃허브 저장소",
-            "내 레포",
-            "레포 목록",
-            "레포지토리 목록",
-            "저장소 목록",
-            "github repos",
-        )
+    if _matches(
+        "깃허브 레포",
+        "깃허브 저장소",
+        "내 레포",
+        "레포 목록",
+        "레포지토리 목록",
+        "저장소 목록",
+        "레포 보여",
+        "레포 조회",
+        "저장소 조회",
+        "github repos",
     ):
         return {"subcommand": "github", "positional": ["repos"], "raw": first_line}
 
-    if any(
-        k in lower
-        for k in (
-            "깃허브 스캔",
-            "레포 스캔",
-            "저장소 스캔",
-            "github scan",
-            "깃허브 진단",
-        )
-    ) or ("https://github.com/" in lower and "pull" not in lower):
-        pos = ["scan"]
-        if gh_repo_match:
-            pos.append(gh_repo_match.group(1))
-        return {"subcommand": "github", "positional": pos, "raw": first_line}
-
-    if any(
-        k in lower
-        for k in (
+    if (
+        bool(re.search(r"(?<![a-z])pr(?![a-z])", lower))
+        or _matches(
             "깃허브 pr",
             "깃허브에 pr",
             "pr 생성",
             "피알 생성",
             "풀리퀘스트",
+            "풀리퀘",
+            "pull request",
             "pr 만들어",
             "pr 올려",
+            "pr 날려",
+            "pr 보내",
+            "pr 해",
             "피알 올려",
             "피알 만들어",
+            "피알 해",
             "깃허브 푸시",
             "깃허브에 올려",
             "깃허브 커밋",
             "깃허브에 반영",
             "레포에 올려",
+            "레포에 푸시",
+            "브랜치 푸시",
+            "커밋하고 푸시",
             "github pr",
             "github push",
         )
@@ -504,20 +480,63 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
             pos.append(gh_repo_match.group(1))
         return {"subcommand": "github", "positional": pos, "raw": first_line}
 
-    if any(
-        k in lower
-        for k in (
-            "깃허브 로그인",
-            "깃허브 연동",
-            "깃허브 인증",
-            "깃허브 연결",
-            "깃허브",
-            "github login",
-            "github auth",
-            "github",
+    if (
+        _matches(
+            "깃허브 스캔",
+            "레포 스캔",
+            "저장소 스캔",
+            "github scan",
+            "깃허브 진단",
+            "레포 진단",
+            "저장소 진단",
+            "깃허브 분석",
+            "레포 분석",
+        )
+        or ("https://github.com/" in lower and "pull" not in lower)
+        or (
+            gh_repo_match
+            and not first_line.lower().startswith("cm ")
+            and _matches("스캔", "진단", "분석", "검사", "scan", "check", "audit")
         )
     ):
+        pos = ["scan"]
+        if gh_repo_match:
+            pos.append(gh_repo_match.group(1))
+        return {"subcommand": "github", "positional": pos, "raw": first_line}
+
+    if _matches(
+        "깃허브 로그인",
+        "깃허브 연동",
+        "깃허브 인증",
+        "깃허브 연결",
+        "깃허브",
+        "github login",
+        "github auth",
+        "github",
+    ):
         return {"subcommand": "github", "positional": ["login"], "raw": first_line}
+
+    if _matches(
+        "패치 적용",
+        "패치해",
+        "전체 패치",
+        "모두 패치",
+        "전부 패치",
+        "취약점 수정",
+        "코드 고쳐",
+        "다 고쳐",
+        "전부 고쳐",
+        "apply patch",
+        "apply all",
+        "fix all",
+    ):
+        vid_match = re.search(r"(CM-[A-Z0-9-]+-\d+)", first_line, re.IGNORECASE)
+        return {
+            "subcommand": "fix",
+            "revert": False,
+            "positional": [vid_match.group(1).upper()] if vid_match else ["ALL"],
+            "raw": first_line,
+        }
 
     return None
 
@@ -1969,6 +1988,7 @@ async def execute_cm_command(
                 repo_full_name=target_repo,
                 workspace=workspace,
                 subpath=subpath,
+                state=state,
             )
             if fetch_res.get("status") != "ok":
                 return {

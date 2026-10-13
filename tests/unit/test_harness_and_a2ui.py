@@ -596,9 +596,18 @@ def test_github_pr_routing_and_vcs_stage_auto_apply(monkeypatch) -> None:
 
     monkeypatch.setenv("CM_DISABLE_LLM_NETWORK", "true")
 
-    for phrase in ("깃허브 PR 생성", "pr 생성", "풀리퀘스트 만들어줘", "깃허브에 올려줘"):
+    for phrase in (
+        "pr만들어봐",
+        "pr생성",
+        "pr해줘",
+        "피알만들어봐",
+        "깃허브 PR 생성",
+        "pr 생성",
+        "풀리퀘스트 만들어줘",
+        "깃허브에 올려줘",
+    ):
         parsed = parse_cm_chat_command(phrase)
-        assert parsed is not None
+        assert parsed is not None, f"Failed to parse PR phrase: {phrase!r}"
         assert parsed["subcommand"] == "github"
         assert parsed["positional"][0] == "pr"
 
