@@ -542,6 +542,26 @@ def extract_files_from_genai_parts(
                 code_str = match.group("code")
                 if not code_str or not code_str.strip():
                     continue
+                active_lines = [
+                    ln.strip()
+                    for ln in code_str.splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")
+                ]
+                if not active_lines:
+                    continue
+                if all(
+                    re.match(
+                        r"^(?:cm|gh|git|gcloud|uv|curl|export|\./scripts/)\b",
+                        ln,
+                        re.IGNORECASE,
+                    )
+                    for ln in active_lines
+                ):
+                    continue
+                from app.harness.cm_commands import parse_cm_chat_command
+
+                if len(active_lines) <= 3 and parse_cm_chat_command(code_str) is not None:
+                    continue
                 default_name = _LANG_TO_DEFAULT_FILENAME.get(
                     lang, f"snippet_{match_idx + 1}.py"
                 )

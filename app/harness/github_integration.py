@@ -399,10 +399,13 @@ def logout_github_auth(state: Any = None) -> None:
         state["cm_github_auth"] = {}
 
 
-def list_user_github_repos(token: str, limit: int = 20) -> list[dict[str, Any]]:
-    """Lists the authenticated user's recently updated GitHub repositories (including private repos)."""
+def list_user_github_repos(
+    token: str, limit: int = 25, visibility: str = "all"
+) -> list[dict[str, Any]]:
+    """Lists the authenticated user's recently updated GitHub repositories with optional visibility filter ('all', 'private', 'public')."""
+    vis = (visibility or "all").strip().lower()
     if os.getenv("CM_DISABLE_LLM_NETWORK", "false").lower() == "true":
-        return [
+        mock_repos = [
             {
                 "full_name": "codemender-user/payment-gateway-service",
                 "private": True,
@@ -422,22 +425,33 @@ def list_user_github_repos(token: str, limit: int = 20) -> list[dict[str, Any]]:
                 "description": "CodeMender C/Python vulnerability testbed",
             },
         ]
+        if vis == "private":
+            return [r for r in mock_repos if r["private"]]
+        if vis == "public":
+            return [r for r in mock_repos if not r["private"]]
+        return mock_repos
 
+    per_page = min(max(limit * 3, 60), 100)
     status, data = _github_api_request(
         "GET",
-        f"/user/repos?sort=updated&direction=desc&per_page={limit}&affiliation=owner,collaborator,organization_member",
+        f"/user/repos?sort=updated&direction=desc&per_page={per_page}&affiliation=owner,collaborator,organization_member",
         token,
     )
     if status != 200 or not isinstance(data, list):
         return []
     repos: list[dict[str, Any]] = []
-    for r in data[:limit]:
+    for r in data:
         if not isinstance(r, dict):
+            continue
+        is_priv = bool(r.get("private", False))
+        if vis == "private" and not is_priv:
+            continue
+        if vis == "public" and is_priv:
             continue
         repos.append(
             {
                 "full_name": r.get("full_name", ""),
-                "private": bool(r.get("private", False)),
+                "private": is_priv,
                 "default_branch": r.get("default_branch", "main"),
                 "language": r.get("language") or "-",
                 "updated_at": str(r.get("updated_at") or "")[:19].replace("T", " "),
@@ -445,6 +459,8 @@ def list_user_github_repos(token: str, limit: int = 20) -> list[dict[str, Any]]:
                 "description": (r.get("description") or "")[:60],
             }
         )
+        if len(repos) >= limit:
+            break
     return repos
 
 

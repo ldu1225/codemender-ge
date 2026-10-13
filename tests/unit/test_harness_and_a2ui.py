@@ -752,4 +752,25 @@ def test_conversational_context_and_natural_commands(monkeypatch) -> None:
     assert "gemini-3.8-flash" in model_out
     assert "ACTIVE" in model_out
 
+    # 5. Connect GitHub in this test session, then test "내 래포목록 프라이빗만" -> PRIVATE filter!
+    _chat("깃허브 로그인")
+    _chat("깃허브 인증 완료")
+    priv_out = _chat("내 래포목록 프라이빗만")
+    assert "비공개(Private) GitHub 레포지토리 목록" in priv_out
+    assert "payment-gateway-service" in priv_out
+    assert "codemender-security-demo" not in priv_out
+
+    # 6. Ask "내 깃리포목록" -> MUST route to `cm github repos` showing both Public and Private!
+    all_repos_out = _chat("내 깃리포목록")
+    assert "payment-gateway-service" in all_repos_out
+    assert "codemender-security-demo" in all_repos_out
+
+    # 7. Multi-line and fenced CLI command `cm repo list --visibility private` -> MUST NOT scan `uploaded_snippet.py`!
+    multiline_cmd_out = _chat(
+        "니가직접해서 가져오라고\n\n```bash\ncm repo list --visibility private\n```"
+    )
+    assert "uploaded_snippet.py" not in multiline_cmd_out
+    assert "비공개(Private) GitHub 레포지토리 목록" in multiline_cmd_out
+    assert "payment-gateway-service" in multiline_cmd_out
+
 

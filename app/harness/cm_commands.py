@@ -223,8 +223,51 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
     if not user_text or not user_text.strip():
         return None
     stripped = user_text.strip()
-    first_line = stripped.splitlines()[0].strip()
+    # Strip markdown code fences (```bash ... ```) when looking for CLI commands
+    un_fenced = re.sub(r"```[A-Za-z0-9_+-]*\s*\n?", "\n", stripped).replace("```", "\n")
+    non_empty_lines = [
+        ln.strip()
+        for ln in un_fenced.splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    if not non_empty_lines:
+        return None
+
+    first_line = non_empty_lines[0]
+    # If the user wrote a natural message on line 1 and a `cm ...` or `gh ...` command on a subsequent line, pick the command line
+    for cand_ln in non_empty_lines:
+        cand_low = cand_ln.lower()
+        if (
+            cand_low == "cm"
+            or cand_low.startswith("cm ")
+            or cand_low.startswith("gh repo")
+        ):
+            first_line = cand_ln
+            break
+
     lower = first_line.lower()
+    full_lower = (
+        un_fenced.lower()
+        .replace("래포", "레포")
+        .replace("리포", "레포")
+        .replace("깃레포", "깃허브 레포")
+        .replace("깃허브레포", "깃허브 레포")
+    )
+
+    visibility_filter = "all"
+    if any(k in full_lower for k in ("프라이빗", "비공개", "private")):
+        visibility_filter = "private"
+    elif any(k in full_lower for k in ("퍼블릭", "공개만", "오픈소스만", "public")):
+        visibility_filter = "public"
+
+    # Support `gh repo list [--visibility private|public]` directly in chat
+    if lower.startswith("gh repo"):
+        return {
+            "subcommand": "github",
+            "positional": ["repos"],
+            "visibility": visibility_filter,
+            "raw": first_line,
+        }
 
     # 1. Explicit `cm ...` CLI syntax in chat (tolerating Korean verb suffixes like `cm session쳐봐.\`)
     if lower == "cm" or lower.startswith("cm "):
@@ -258,9 +301,12 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
             "logs": "cost",
             "gh": "github",
             "github": "github",
+            "repo": "github",
+            "repos": "github",
             "report": "report",
             "reports": "report",
         }
+        orig_sub = sub
         sub = sub_aliases.get(sub, sub)
         rest = tokens[2:]
 
@@ -275,9 +321,13 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
         force_flag = "--force" in rest
 
         positional: list[str] = []
+        if orig_sub in ("repo", "repos"):
+            positional.append("repos")
+
         i = 0
         while i < len(rest):
             tok = rest[i]
+            tok_low = tok.lower()
             if tok in ("--model", "-m") and i + 1 < len(rest):
                 model_override = rest[i + 1]
                 i += 2
@@ -287,6 +337,22 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
             elif tok in ("-f", "--format") and i + 1 < len(rest):
                 fmt = rest[i + 1].lower()
                 i += 2
+            elif tok_low in ("--visibility", "-v") and i + 1 < len(rest):
+                v_val = rest[i + 1].lower().strip()
+                if v_val in ("private", "public", "all"):
+                    visibility_filter = v_val
+                i += 2
+            elif tok_low.startswith("--visibility="):
+                v_val = tok_low.split("=", 1)[1].strip()
+                if v_val in ("private", "public", "all"):
+                    visibility_filter = v_val
+                i += 1
+            elif tok_low == "--private":
+                visibility_filter = "private"
+                i += 1
+            elif tok_low == "--public":
+                visibility_filter = "public"
+                i += 1
             elif tok == "--revert":
                 revert_flag = True
                 if i + 1 < len(rest) and not rest[i + 1].startswith("-"):
@@ -301,12 +367,27 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
                 if re.match(r"^[가-힣.!?\s\\]+$", tok):
                     i += 1
                     continue
+                if orig_sub in ("repo", "repos") and tok_low in ("list", "ls", "repos"):
+                    i += 1
+                    continue
+                if tok_low in ("private", "public") and sub == "github":
+                    visibility_filter = tok_low
+                    i += 1
+                    continue
                 positional.append(tok)
                 i += 1
+
+        if sub == "scan":
+            if positional and ("/" in positional[0] or "github.com" in positional[0]):
+                sub = "github"
+                positional = ["scan"] + positional
+            else:
+                sub = "find"
 
         return {
             "subcommand": sub,
             "positional": positional,
+            "visibility": visibility_filter,
             "model": model_override,
             "extra_context": extra_context,
             "format": fmt,
@@ -319,11 +400,17 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
         }
 
     # 2. Natural-language Korean / English command mapping (space-insensitive for Korean phrasing)
+    lower = full_lower
     no_space = re.sub(r"\s+", "", lower)
 
     def _matches(*keywords: str) -> bool:
         for k in keywords:
-            k_low = k.lower()
+            k_low = (
+                k.lower()
+                .replace("래포", "레포")
+                .replace("리포", "레포")
+                .replace("깃레포", "깃허브 레포")
+            )
             k_ns = re.sub(r"\s+", "", k_low)
             if k_low in lower or (k_ns and k_ns in no_space):
                 return True
@@ -515,15 +602,34 @@ def parse_cm_chat_command(user_text: str) -> dict[str, Any] | None:
         "깃허브 레포",
         "깃허브 저장소",
         "내 레포",
+        "내 저장소",
         "레포 목록",
+        "레포 리스트",
         "레포지토리 목록",
         "저장소 목록",
+        "저장소 리스트",
         "레포 보여",
         "레포 조회",
+        "레포 알려",
+        "레포 가져와",
         "저장소 조회",
+        "저장소 보여",
+        "프라이빗 레포",
+        "비공개 레포",
+        "비공개 저장소",
+        "퍼블릭 레포",
+        "공개 레포",
+        "공개 저장소",
         "github repos",
+        "repo list",
+        "my repos",
     ):
-        return {"subcommand": "github", "positional": ["repos"], "raw": first_line}
+        return {
+            "subcommand": "github",
+            "positional": ["repos"],
+            "visibility": visibility_filter,
+            "raw": first_line,
+        }
 
     if (
         bool(re.search(r"(?<![a-z])pr(?![a-z])", lower))
@@ -2038,16 +2144,39 @@ async def execute_cm_command(
 
         # 13a. `cm github status` / `cm github repos`
         if gh_action in ("status", "verify", "whoami", "repos", "list"):
-            repos = list_user_github_repos(token, limit=15)
+            vis_filter = str(parsed_cmd.get("visibility") or "all").lower()
+            raw_low = str(parsed_cmd.get("raw") or "").lower()
+            if vis_filter == "all":
+                if any(k in raw_low for k in ("프라이빗", "비공개", "private")) or any(
+                    a.lower() in ("private", "--private") for a in gh_args
+                ):
+                    vis_filter = "private"
+                elif any(k in raw_low for k in ("퍼블릭", "공개만", "public")) or any(
+                    a.lower() in ("public", "--public") for a in gh_args
+                ):
+                    vis_filter = "public"
+
+            repos = list_user_github_repos(token, limit=30, visibility=vis_filter)
+            if vis_filter == "private":
+                section_title = f"#### 🔒 내 비공개(Private) GitHub 레포지토리 목록 (총 {len(repos)}개)"
+            elif vis_filter == "public":
+                section_title = f"#### 🌐 내 공개(Public) GitHub 레포지토리 목록 (총 {len(repos)}개)"
+            else:
+                section_title = f"#### 📂 내 GitHub 레포지토리 목록 (총 {len(repos)}개 — Public & Private)"
+
             lines = [
                 f"### ✅ GitHub 계정 연동 완료 — `@{gh_login}` ({gh_name})",
                 f"- **연동된 GitHub 프로필**: **[@{gh_login} ({gh_url})]({gh_url})**",
-                f"- **보유 레포지토리**: Public **{current_auth.get('public_repos', 0)}개** · Private **{current_auth.get('total_private_repos', 0)}개** (총 조회된 최근 활동 레포: **{len(repos)}개**)",
+                f"- **보유 레포지토리**: Public **{current_auth.get('public_repos', 0)}개** · Private **{current_auth.get('total_private_repos', 0)}개** (현재 필터: **`{vis_filter.upper()}`** · 표시된 레포: **{len(repos)}개**)",
                 "",
-                "#### 📂 내 GitHub 레포지토리 목록 (클릭 또는 명령어로 즉시 보안 스캔 & 자동 PR 가능)",
+                section_title,
                 "| # | 레포지토리 (`owner/repo`) | 공개 여부 | 기본 브랜치 | 주 언어 | 최근 업데이트 | 즉시 스캔 명령어 |",
                 "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
             ]
+            if not repos:
+                lines.append(
+                    f"| `-` | *(조건(`{vis_filter}`)에 해당하는 레포지토리가 없습니다)* | `-` | `-` | `-` | `-` | `내 레포 목록` (전체 조회) |"
+                )
             for r_idx, r in enumerate(repos, start=1):
                 vis = "🔒 Private" if r.get("private") else "🌐 Public"
                 fn = r.get("full_name", "")
@@ -2060,6 +2189,7 @@ async def execute_cm_command(
                     "",
                     "---",
                     "💡 **바로 실행 가능한 GitHub 연동 명령어**:",
+                    "- **전체 / 비공개 / 공개 필터 조회**: **`내 레포 목록`** · **`내 레포 목록 프라이빗만`** · **`내 레포 목록 퍼블릭만`**",
                     f"- **내 레포지토리 코드 취약점 스캔**: **`깃허브 스캔 {repos[0]['full_name'] if repos else f'{gh_login}/my-repo'}`** (또는 `cm github scan <owner/repo>`)",
                     f"- **현재 패치된 보안 코드를 내 GitHub에 커밋 & PR 생성**: **`깃허브 PR 생성`** (또는 `cm github pr [owner/repo]`)",
                     "- **다른 계정으로 재인증**: **`cm github login --force`** | **연동 해제**: **`깃허브 로그아웃`**",

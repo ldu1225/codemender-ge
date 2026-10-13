@@ -673,7 +673,7 @@ async def _codemender_before_agent_callback_inner(
         except Exception as exc:
             logger.debug(f"Artifact save skipped in memory mode: {exc}")
 
-    # 4. Extract newly uploaded files or pasted code snippets first if present
+    # 4. Extract newly uploaded files or pasted source code snippets first if present
     try:
         newly_ingested = extract_files_from_genai_parts(expanded_parts, ws)
     except WorkspaceSecurityError as sec_err:
@@ -925,11 +925,15 @@ def _generate_contextual_chat_response(
     from google import genai
     from google.genai import types as genai_types
     from app.config import CODEMENDER_FALLBACK_MODEL
+    from app.harness.github_integration import (
+        list_user_github_repos,
+        poll_or_verify_github_auth,
+    )
 
     ws_files = [f.relative_path for f in getattr(ws, "files", [])]
     pipe_dict = state.get("cm_pipeline_result") if hasattr(state, "get") else None
     gh_ctx = state.get("cm_github_repo_context") if hasattr(state, "get") else None
-    gh_auth = state.get("cm_github_auth") if hasattr(state, "get") else None
+    gh_auth = poll_or_verify_github_auth(state)
 
     ctx_lines = [
         f"- 현재 활성 모델: {active_model}",
@@ -939,8 +943,23 @@ def _generate_contextual_chat_response(
         ctx_lines.append(
             f"- 최근 스캔한 GitHub 레포지토리: {gh_ctx.get('repo')} (브랜치: {gh_ctx.get('branch', 'main')})"
         )
-    if isinstance(gh_auth, dict) and gh_auth.get("login"):
+    if isinstance(gh_auth, dict) and gh_auth.get("authenticated") and gh_auth.get("login"):
         ctx_lines.append(f"- 연동된 GitHub 계정: @{gh_auth.get('login')}")
+        try:
+            user_repos = list_user_github_repos(
+                str(gh_auth.get("access_token") or ""), limit=25, visibility="all"
+            )
+            if user_repos:
+                repo_summaries = [
+                    f"{r['full_name']} ({'Private/비공개' if r.get('private') else 'Public/공개'}, 주언어:{r.get('language', '-')})"
+                    for r in user_repos
+                ]
+                ctx_lines.append(
+                    f"- @{gh_auth.get('login')} 계정의 실제 GitHub 보유 레포지토리 목록({len(user_repos)}개): "
+                    + ", ".join(repo_summaries)
+                )
+        except Exception:
+            pass
 
     if isinstance(pipe_dict, dict):
         findings = pipe_dict.get("findings") or []
@@ -967,7 +986,9 @@ def _generate_contextual_chat_response(
             "간단히 어떤 보안 진단·모델 관리·GitHub PR 작업을 도와줄 수 있는지 1~2줄로 덧붙이세요.)\n"
             "2. 사용자가 현재 세션에서 스캔한 코드, 발견된 취약점, 패치 내용, 보안 개념(CWE/OWASP), 모델, GitHub 연동에 대해 질문하면 "
             "아래 [현재 세션 컨텍스트]를 바탕으로 구체적이고 전문적으로 답변하세요.\n"
-            "3. 불필요하게 긴 명령어 표를 반복 출력하지 말고 핵심만 깔끔한 마크다운으로 답변하세요.\n\n"
+            "3. 절대 사용자에게 '터미널에서 직접 명령어를 실행하세요'(예: 'gh repo list', 'cm repo list --visibility private' 등 존재하지 않거나 터미널용인 명령어)라고 떠넘기지 마세요! "
+            "당신은 이미 GitHub API와 연동된 에이전트이므로 [현재 세션 컨텍스트]에 제공된 실제 GitHub 레포지토리 목록(Private/Public 구분 포함)을 사용해 그 자리에서 즉시 직접 목록을 보여주세요.\n"
+            "4. 불필요하게 긴 명령어 표를 반복 출력하지 말고 핵심만 깔끔한 마크다운으로 답변하세요.\n\n"
             f"[현재 세션 컨텍스트]\n{context_block}\n\n"
             f"[사용자 메시지]\n{user_text}"
         )
