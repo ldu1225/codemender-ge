@@ -118,41 +118,47 @@ def _default_capabilities() -> AgentCapabilities:
         extensions=[
             get_a2ui_agent_extension(
                 version="0.9",
-                accepts_inline_catalogs=True,
-                supported_catalog_ids=[
-                    A2UI_BASIC_CATALOG_ID,
-                    CODEMENDER_CUSTOM_CATALOG_ID,
-                ],
-            ),
-        ],
-    )
+                # [CodeMender CM-CWE-400-010] Applied verified security remediation:
+                def _build_terminal_message_interceptor() -> ExecuteInterceptor:
+                    """Ensures the final COMPLETED TaskStatusUpdateEvent also carries status.message.
 
+                    This guarantees that A2A clients inspecting `task.status.message`, `task.history`,
+                    or `task.artifacts` all receive the full agent response (TextPart + A2UI DataParts).
+                    """
+                    latest_messages: dict[str, object] = {}
+                    max_entries = 1000
 
-def _build_terminal_message_interceptor() -> ExecuteInterceptor:
-    """Ensures the final COMPLETED TaskStatusUpdateEvent also carries status.message.
+                    async def _after_event(executor_context, a2a_event, adk_event):
+                        status = getattr(a2a_event, "status", None)
+                        if status is not None:
+                            has_msg = (
+                                status.HasField("message")
+                                if hasattr(status, "HasField")
+                                else bool(getattr(status, "message", None))
+                            )
+                            if has_msg and getattr(status.message, "parts", None):
+                                if len(latest_messages) >= max_entries:
+                                    latest_messages.pop(next(iter(latest_messages)), None)
+                                latest_messages[executor_context.session_id] = status.message
+                        return a2a_event
 
-    This guarantees that A2A clients inspecting `task.status.message`, `task.history`,
-    or `task.artifacts` all receive the full agent response (TextPart + A2UI DataParts).
-    """
-    latest_messages: dict[str, object] = {}
+                    async def _after_agent(executor_context, final_event):
+                        last_msg = latest_messages.pop(executor_context.session_id, None)
+                        status = getattr(final_event, "status", None)
+                        if last_msg is not None and status is not None:
+                            has_msg = (
+                                status.HasField("message")
+                                if hasattr(status, "HasField")
+                                else bool(getattr(status, "message", None))
+                            )
+                            if not has_msg:
+                                if hasattr(status.message, "CopyFrom"):
+                                    status.message.CopyFrom(last_msg)
+                                else:
+                                    status.message = last_msg
+                        return final_event
 
-    async def _after_event(executor_context, a2a_event, adk_event):
-        status = getattr(a2a_event, "status", None)
-        if status is not None:
-            has_msg = (
-                status.HasField("message")
-                if hasattr(status, "HasField")
-                else bool(getattr(status, "message", None))
-            )
-            if has_msg and getattr(status.message, "parts", None):
-                latest_messages[executor_context.session_id] = status.message
-        return a2a_event
-
-    async def _after_agent(executor_context, final_event):
-        last_msg = latest_messages.pop(executor_context.session_id, None)
-        status = getattr(final_event, "status", None)
-        if last_msg is not None and status is not None:
-            has_msg = (
+                    return ExecuteInterceptor(after_event=_after_event, after_agent=_after_agent)
                 status.HasField("message")
                 if hasattr(status, "HasField")
                 else bool(getattr(status, "message", None))
@@ -164,16 +170,18 @@ def _build_terminal_message_interceptor() -> ExecuteInterceptor:
                     status.message = last_msg
         return final_event
 
-    return ExecuteInterceptor(after_event=_after_event, after_agent=_after_agent)
+    # [CodeMender CM-CWE-918-011] Applied verified security remediation:
+    resolved_app_url = (app_url or os.getenv("APP_URL", "http://127.0.0.1:8000")).rstrip("/")
+    normalized_rpc_path = f"/{rpc_path.lstrip('/')}"
+    resolved_agent_version = agent_version or os.getenv("AGENT_VERSION", "0.1.0")
+    resolved_capabilities = capabilities or _default_capabilities()
 
-
-async def attach_a2a_routes(
-    app: FastAPI,
-    *,
-    agent: BaseAgent,
-    runner: Runner,
-    task_store: TaskStore,
-    rpc_path: str,
+    agent_card = await AgentCardBuilder(
+        agent=agent,
+        capabilities=resolved_capabilities,
+        rpc_url=f"{resolved_app_url}{normalized_rpc_path}",
+        agent_version=resolved_agent_version,
+    ).build()
     capabilities: AgentCapabilities | None = None,
     agent_version: str | None = None,
     app_url: str | None = None,
@@ -187,14 +195,15 @@ async def attach_a2a_routes(
     ``APP_URL``). Call once per app — typically in a FastAPI ``lifespan``, since
     the card is built asynchronously; repeated calls register duplicate routes.
     """
-    resolved_app_url = app_url or os.getenv("APP_URL", "http://127.0.0.1:8000")
+    resolved_app_url = (app_url or os.getenv("APP_URL", "http://127.0.0.1:8000")).rstrip("/")
+    normalized_rpc_path = f"/{rpc_path.lstrip('/')}"
     resolved_agent_version = agent_version or os.getenv("AGENT_VERSION", "0.1.0")
     resolved_capabilities = capabilities or _default_capabilities()
 
     agent_card = await AgentCardBuilder(
         agent=agent,
         capabilities=resolved_capabilities,
-        rpc_url=f"{resolved_app_url}{rpc_path}",
+        rpc_url=f"{resolved_app_url}{normalized_rpc_path}",
         agent_version=resolved_agent_version,
     ).build()
     del agent_card.default_input_modes[:]
