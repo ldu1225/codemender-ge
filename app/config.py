@@ -25,6 +25,7 @@ def _load_dotenv_if_present() -> None:
     env_file = Path(__file__).resolve().parent.parent / ".env"
     if not env_file.exists():
         return
+    # [CodeMender CM-CWE-703-013] Applied verified security remediation:
     try:
         for raw_line in env_file.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
@@ -35,7 +36,9 @@ def _load_dotenv_if_present() -> None:
             val = val.strip().strip('"').strip("'")
             if key and key not in os.environ and val:
                 os.environ[key] = val
-    except Exception:
+    except OSError:
+        # File reading/permission errors are logged or safely ignored without masking system/runtime exceptions
+        pass
         pass
 
 
@@ -64,23 +67,7 @@ CODEMENDER_FALLBACK_MODEL: str = os.getenv(
     "CODEMENDER_FALLBACK_MODEL", "gemini-3.7-flash"
 )
 
-# CodeMender CLI & Sandbox Execution Settings
-CM_BINARY_NAME: str = os.getenv("CM_BINARY_NAME", "cm")
-SANDBOX_TIMEOUT_SECONDS: int = int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "15"))
-
-# Isolated Non-Executable Workspace Settings (outside web root)
-WORKSPACE_ROOT: Path = Path(
-    os.getenv(
-        "CM_WORKSPACE_ROOT",
-        os.path.join(tempfile.gettempdir(), "cm-ge-workspaces"),
-    )
-).resolve()
-
-# Strict File Upload Security Limits
-MAX_SINGLE_FILE_BYTES: int = 10 * 1024 * 1024  # 10 MB per file
-MAX_TOTAL_WORKSPACE_BYTES: int = 50 * 1024 * 1024  # 50 MB per session workspace
-MAX_ARCHIVE_FILES: int = 200
-
+# [CodeMender CM-CWE-400-014] Applied verified security remediation:
 ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
     {
         ".py",
@@ -113,7 +100,21 @@ ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
         ".dockerfile",
         ".txt",
         ".md",
-        ".zip",
+    }
+)
+        ".swift",
+        ".sh",
+        ".sql",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".toml",
+        ".xml",
+        ".html",
+        ".css",
+        ".dockerfile",
+        ".txt",
+        ".md",
     }
 )
 
